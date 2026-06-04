@@ -9,10 +9,11 @@ In:8.4k  |  Out:105.6k  |  Write:483.9k  |  Read:2.1M  |  Total:2.7M
 REPO $0.00  |  30D $2358.65  |  7D $1118.07  |  DAY $248.75  |  🔥 LIVE $9.99  |  $3.64/hr  |  Cache hit: 98%
 18 Dhū al-Ḥijjah 1447  |  Thu, Jun 4, 2026  |  🤖 Opus 4.8 $8.02 (61%) 11.4M ×59  |  Sonnet 4.6 $5.06 (39%) 10.7M ×91
 🕌 Fajr 3:20 AM ✓  |  Dhuhr 12:01 PM ✓  |  Asr 3:40 PM ✓  |  Maghrib 7:04 PM ✓  |  Isha 8:42 PM ✓
-📍 Lahore, Pakistan  |  Plugins:15
+📍 Lahore, Pakistan  |  Skills:15  |  MCP:3
    caveman, superpowers, frontend-design, context7, claude-md-management
    typescript-lsp, security-guidance, claude-code-setup, atlassian, csharp-lsp
    remember, firecrawl, netlify-skills, impeccable, skill-creator
+🔌 atlassian, octa-portal, google-drive
 ```
 
 ## Features
@@ -25,8 +26,9 @@ REPO $0.00  |  30D $2358.65  |  7D $1118.07  |  DAY $248.75  |  🔥 LIVE $9.99 
 | 4 | Costs: REPO / 30D / 7D / DAY · live session cost · burn rate/hr · cache hit % |
 | 5 | Islamic (Hijri) date · Gregorian date · per-model usage (cost, % share, tokens, call count) |
 | 6 | Prayer times — colored: ✓ gray = passed · yellow = next (with countdown) · cyan = upcoming |
-| 7 | Location · plugin count |
-| 8+ | Plugin names (5 per line) |
+| 7 | Location · Skills count · MCP count |
+| 8+ | Skill plugin names (5 per line, cyan) |
+| 9+ | MCP server names (5 per line, magenta) — only if any configured |
 | +1 | Subagent breakdown by type (only when subagents spawned) |
 
 **Performance:** 0.18 s warm (4-file cache), ~3.6 s cold  
@@ -127,6 +129,23 @@ All in `~/.claude/statusline/` — delete any to force a refresh:
 | `burn-cache.json` | 30 s | Burn rate (session-scoped) |
 | `location-cache.json` | 6 h | IP geolocation |
 | `prayer-cache.json` | 1 day | Prayer times |
+
+---
+
+## Config file locations
+
+Claude Code splits configuration across multiple files — this matters for skills, plugins, and MCP servers:
+
+| File | What lives there |
+|------|-----------------|
+| `~/.claude/settings.json` | Skills/plugins (`enabledPlugins`), statusLine command, permissions, model |
+| `~/.claude.json` | **MCP servers** (`mcpServers`) — global, all projects |
+| `.mcp.json` | MCP servers — project-level, overrides/extends global |
+| `~/.claude/plugins/installed_plugins.json` | Installed plugin metadata + versions |
+
+> **Note:** Despite what the official docs say, `mcpServers` in `~/.claude/settings.json` is **ignored** by Claude Code ([issue #4976](https://github.com/anthropics/claude-code/issues/4976)). The real global MCP config is `~/.claude.json`.
+
+This statusline reads from all correct locations automatically.
 
 ---
 
