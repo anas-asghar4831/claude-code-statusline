@@ -146,17 +146,25 @@ const rowCost = (r) => (r.in * P[0] + r.out * P[1] + r.cw * P[2] + r.cr * P[3]) 
 
 // ── Cost calc (REPO + DAY/7D/30D), cached 5min ───────────────────────────────
 function calcCosts() {
-  // use LAUNCH_DIR for REPO so worktrees show main project cost, not worktree-specific cost
-  const repoBase = LAUNCH_DIR || DIR;
-  const slug = repoBase.replace(/[:/\\]/g, '-');
-  const projDir = path.join(PROJECTS_DIR, slug);
+  // REPO = main project + all its worktrees. Derive repo root by stripping any
+  // /.worktrees/<name> suffix, then match that slug + any "<slug>--worktrees-*" folder.
+  const repoRoot = DIR.split('/.worktrees/')[0];
+  const repoSlug = repoRoot.replace(/[:/\\]/g, '-');
   let repo = 0;
   const seenR = new Set();
-  for (const f of jsonlFiles(projDir, 0)) {
-    for (const r of usageRows(f)) {
-      if (r.id && seenR.has(r.id)) continue;
-      if (r.id) seenR.add(r.id);
-      repo += rowCost(r);
+  let projFolders = [];
+  try {
+    projFolders = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+      .filter(e => e.isDirectory() && (e.name === repoSlug || e.name.startsWith(repoSlug + '--worktrees-')))
+      .map(e => path.join(PROJECTS_DIR, e.name));
+  } catch (_) {}
+  for (const pf of projFolders) {
+    for (const f of jsonlFiles(pf, 0)) {
+      for (const r of usageRows(f)) {
+        if (r.id && seenR.has(r.id)) continue;
+        if (r.id) seenR.add(r.id);
+        repo += rowCost(r);
+      }
     }
   }
   const today = new Date(); today.setHours(0, 0, 0, 0);
