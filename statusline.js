@@ -441,7 +441,7 @@ L2 += ` ${SEP} ${C.gray}Commits:${R}${C.gold}${gitCommits}${R}`;
 if (DURATION_MS) {
   const dur = fmtDur(DURATION_MS);
   const apiPct = DURATION_MS > 0 ? Math.round(API_DUR_MS * 100 / DURATION_MS) : 0;
-  L2 += ` ${SEP} ${C.gray}⏱${R}${C.cyan}${dur}${R} ${C.gray}(${apiPct}% API)${R}`;
+  L2 += ` ${SEP} ${C.gray}⏱ ${R}${C.cyan}${dur}${R} ${C.gray}(${apiPct}% API)${R}`;
 }
 L2 += ` ${SEP} ${C.bold}🕐 ${clock()}${R}`;
 console.log(L2);
@@ -494,7 +494,6 @@ if (AGENT_NAME) L5parts.push(`🤖 ${C.magenta}agent:${AGENT_NAME}${R}`);
 if (OUTPUT_STYLE && OUTPUT_STYLE !== 'default') L5parts.push(`🎨 ${C.gray}${OUTPUT_STYLE}${R}`);
 if (ADDED_DIRS && ADDED_DIRS.length) L5parts.push(`📁 ${C.gray}+${ADDED_DIRS.length} dirs${R}`);
 if (VIM_MODE)  L5parts.push(`${C.gold}[${VIM_MODE}]${R}`);
-if (VERSION)   L5parts.push(`${C.gray}v${VERSION}${R}`);
 if (L5parts.length) console.log(L5parts.join(SEP));
 
 // ── LINE 6: prayers ───────────────────────────────────────────────────────────
@@ -522,6 +521,7 @@ const locDisp = [loc.city, loc.country].filter(Boolean).join(', ') || 'Unknown';
 let L7 = `📍 ${C.gray}${locDisp}${R} ${SEP} ${C.gray}Plugins:${R}${C.cyan}${plugins.length}${R}`;
 L7 += ` ${SEP} ${C.gray}Skills:${R}${C.green}${skillCount}${R}`;
 if (mcpServers.length) L7 += ` ${SEP} ${C.gray}MCP:${R}${C.magenta}${mcpServers.length}${R}`;
+if (VERSION) L7 += ` ${SEP} ${C.gray}v${VERSION}${R}`;
 console.log(L7);
 
 // ── Plugin names (5/line) ─────────────────────────────────────────────────────
