@@ -450,7 +450,14 @@ if (cbTotal > 0) {
   L1c += ` ${SEP} ${C.gray}+Cache${R} ${C.orange}${fmtTok(cbCw)}${R}`; // newly cached this turn
   L1c += ` ${SEP} ${C.gray}Fresh${R} ${C.blue}${fmtTok(cbIn)}${R}`;    // uncached new input
   L1c += ` ${SEP} ${C.gray}Out${R} ${C.magenta}${fmtTok(cbOut)}${R}`;
-  if (baseOverhead > 0) L1c += ` ${SEP} ${C.gray}base~${R}${C.yellow}${fmtTok(baseOverhead)}${R} ${C.gray}(sys+tools+mcp)${R}`;
+  if (baseOverhead > 0) {
+    // split measured base into estimated parts. sys+tools are ~constant for Claude Code;
+    // mcp+ = measured remainder (mcp tools + custom agents + memory files).
+    const SYS_EST = 4600, TOOLS_EST = 16700;
+    const mcpPlus = Math.max(0, baseOverhead - SYS_EST - TOOLS_EST);
+    L1c += ` ${SEP} ${C.gray}base~${R}${C.yellow}${fmtTok(baseOverhead)}${R}`;
+    L1c += ` ${C.gray}(sys~${R}${C.yellow}${fmtTok(SYS_EST)}${R} ${C.gray}· tools~${R}${C.yellow}${fmtTok(TOOLS_EST)}${R} ${C.gray}· mcp+~${R}${C.yellow}${fmtTok(mcpPlus)}${R}${C.gray})${R}`;
+  }
   console.log(L1c);
 }
 
