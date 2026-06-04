@@ -146,7 +146,9 @@ const rowCost = (r) => (r.in * P[0] + r.out * P[1] + r.cw * P[2] + r.cr * P[3]) 
 
 // ── Cost calc (REPO + DAY/7D/30D), cached 5min ───────────────────────────────
 function calcCosts() {
-  const slug = DIR.replace(/[:/\\]/g, '-');
+  // use LAUNCH_DIR for REPO so worktrees show main project cost, not worktree-specific cost
+  const repoBase = LAUNCH_DIR || DIR;
+  const slug = repoBase.replace(/[:/\\]/g, '-');
   const projDir = path.join(PROJECTS_DIR, slug);
   let repo = 0;
   const seenR = new Set();
@@ -403,8 +405,6 @@ if (SESSION_NAME) L1 += `${C.pink}${C.bold}${SESSION_NAME}${R}  `;
 L1 += `${dirDisplay}${branchStr} ${gitIcon}`;
 L1 += ` ${SEP} 🧠 ${C.magenta}${MODEL}${R}`;
 if (FAST_MODE)  L1 += ` ${SEP} ${C.yellow}⚡fast${R}`;
-if (EFFORT)     L1 += ` ${SEP} ${C.gray}effort:${R}${C.orange}${EFFORT}${R}`;
-if (THINKING)   L1 += ` ${SEP} ${C.cyan}💭 thinking${R}`;
 if (EXCEEDS_200K) L1 += ` ${SEP} ${C.red}${C.bold}⚠ >200K${R}`;
 const ctxSizeStr = CTX_SIZE >= 1e6 ? (CTX_SIZE / 1e6).toFixed(0) + 'M' : (CTX_SIZE / 1000).toFixed(0) + 'k';
 const ctxUsedStr = CTX_TOTAL_IN > 0 ? fmtTok(CTX_TOTAL_IN + CTX_TOTAL_OUT) + '/' + ctxSizeStr : fmtTok(CTX_TOKENS);
@@ -418,6 +418,8 @@ L1b += ` ${SEP} ${C.gray}Out:${R}${C.magenta}${fmtTok(sOut)}${R}`;
 L1b += ` ${SEP} ${C.gray}Write:${R}${C.orange}${fmtTok(sCw)}${R}`;
 L1b += ` ${SEP} ${C.gray}Read:${R}${C.teal}${fmtTok(sCr)}${R}`;
 L1b += ` ${SEP} ${C.gray}Total:${R}${C.white}${fmtTok(sTotal)}${R}`;
+if (EFFORT)   L1b += ` ${SEP} ${C.gray}effort:${R}${C.orange}${EFFORT}${R}`;
+if (THINKING) L1b += ` ${SEP} ${C.cyan}💭 thinking${R}`;
 console.log(L1b);
 
 // ── LINE 2: rate limits | git changes | ahead/behind | commits | duration | API% | clock ──
