@@ -58,9 +58,11 @@ const CTX_TOTAL_IN = Number(g(J, 'context_window.total_input_tokens', 0)) || 0;
 const CTX_TOTAL_OUT= Number(g(J, 'context_window.total_output_tokens', 0)) || 0;
 const CTX_SIZE     = Number(g(J, 'context_window.context_window_size', 200000)) || 200000;
 const EXCEEDS_200K = g(J, 'exceeds_200k_tokens', false);
-const CTX_TOKENS   = (Number(g(J, 'context_window.current_usage.input_tokens', 0)) || 0)
-  + (Number(g(J, 'context_window.current_usage.cache_creation_input_tokens', 0)) || 0)
-  + (Number(g(J, 'context_window.current_usage.cache_read_input_tokens', 0)) || 0);
+const CU_IN   = Number(g(J, 'context_window.current_usage.input_tokens', 0)) || 0;
+const CU_CW   = Number(g(J, 'context_window.current_usage.cache_creation_input_tokens', 0)) || 0;
+const CU_CR   = Number(g(J, 'context_window.current_usage.cache_read_input_tokens', 0)) || 0;
+const CU_OUT  = Number(g(J, 'context_window.current_usage.output_tokens', 0)) || 0;
+const CTX_TOKENS = CU_IN + CU_CW + CU_CR;
 
 // cost & timing
 const LIVE_COST    = Number(g(J, 'cost.total_cost_usd', 0)) || 0;
@@ -210,9 +212,10 @@ else if (TRANSCRIPT && fs.existsSync(TRANSCRIPT)) {
   writeCache('burn-cache.json', { d: burn, ts: NOW, sid: SESSION_ID });
 }
 
-// ── Session tokens + per-model usage ─────────────────────────────────────────
+// ── Session tokens + per-model usage + ctx breakdown ─────────────────────────
 let sIn = 0, sOut = 0, sCw = 0, sCr = 0;
 const models = {};
+let lastRow = null, firstRow = null; // for live-window breakdown + base overhead
 if (TRANSCRIPT && fs.existsSync(TRANSCRIPT)) {
   const seen = new Set();
   for (const r of usageRows(TRANSCRIPT)) {
@@ -221,12 +224,21 @@ if (TRANSCRIPT && fs.existsSync(TRANSCRIPT)) {
     sIn += r.in; sOut += r.out; sCw += r.cw; sCr += r.cr;
     const id = r.model || 'default';
     if (id === '<synthetic>') continue;
+    if (!firstRow) firstRow = r;
+    lastRow = r;
     const mp = pricing(id);
     const c = (r.in * mp[0] + r.out * mp[1] + r.cw * mp[2] + r.cr * mp[3]) / 1e6;
     if (!models[id]) models[id] = { cost: 0, tokens: 0, count: 0 };
     models[id].cost += c; models[id].tokens += r.in + r.out + r.cw + r.cr; models[id].count++;
   }
 }
+// Live context window breakdown — prefer JSON current_usage, fallback to last transcript row
+const cbIn = CU_IN  || (lastRow ? lastRow.in : 0);
+const cbCw = CU_CW  || (lastRow ? lastRow.cw : 0);
+const cbCr = CU_CR  || (lastRow ? lastRow.cr : 0);
+const cbOut= CU_OUT || (lastRow ? lastRow.out : 0);
+// Base overhead estimate: first API call's cached+created input ≈ system+tools+mcp+memory load
+const baseOverhead = firstRow ? (firstRow.cr + firstRow.cw) : 0;
 
 function shortModel(id) {
   let m;
@@ -429,6 +441,18 @@ L1b += ` ${SEP} ${C.gray}Total:${R}${C.white}${fmtTok(sTotal)}${R}`;
 if (EFFORT)   L1b += ` ${SEP} ${C.gray}effort:${R}${C.orange}${EFFORT}${R}`;
 if (THINKING) L1b += ` ${SEP} ${C.cyan}💭 thinking${R}`;
 console.log(L1b);
+
+// ── LINE 1c: live context-window breakdown (last API call) ───────────────────
+const cbTotal = cbIn + cbCw + cbCr;
+if (cbTotal > 0) {
+  let L1c = `${C.gray}🧮 ctx:${R}`;
+  L1c += ` ${C.gray}Reused${R} ${C.teal}${fmtTok(cbCr)}${R}`;       // cache_read = system+tools+mcp+memory+history
+  L1c += ` ${SEP} ${C.gray}+Cache${R} ${C.orange}${fmtTok(cbCw)}${R}`; // newly cached this turn
+  L1c += ` ${SEP} ${C.gray}Fresh${R} ${C.blue}${fmtTok(cbIn)}${R}`;    // uncached new input
+  L1c += ` ${SEP} ${C.gray}Out${R} ${C.magenta}${fmtTok(cbOut)}${R}`;
+  if (baseOverhead > 0) L1c += ` ${SEP} ${C.gray}base~${R}${C.yellow}${fmtTok(baseOverhead)}${R} ${C.gray}(sys+tools+mcp)${R}`;
+  console.log(L1c);
+}
 
 // ── LINE 2: rate limits | git changes | ahead/behind | commits | duration | API% | clock ──
 let rateStr = `${C.gray}No rate limit data${R}`;
