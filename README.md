@@ -3,31 +3,35 @@
 A fast, feature-rich status line for [Claude Code](https://claude.ai/code) on **Windows 11** (Node.js, works in Windows Terminal / Git Bash).
 
 ```
-D:/Dev/Octacer/project → .worktrees/ui-reorg  (main) ✅  |  🧠 Opus 4.8 (1M context)  |  ██░░░░░░░░ 22% (224.2k)
-In:8.4k  |  Out:105.6k  |  Write:483.9k  |  Read:2.1M  |  Total:2.7M
-⊙ 5H 2:10 AM (3h 0m) 47% • 7DAY Tue 4:00 AM (4d 4h) 57%  |  +73/-82  |  Commits:127  |  🕐 11:09 PM
-REPO $0.00  |  30D $2358.65  |  7D $1118.07  |  DAY $248.75  |  🔥 LIVE $9.99  |  $3.64/hr  |  Cache hit: 98%
+D:/Dev/project → .worktrees/ui-reorg  (main) ✅  |  🧠 Opus 4.8 (1M context)  |  ██░░░░░░░░ 22% (269.2k/1M)
+In:8.4k  |  Out:105.6k  |  Write:483.9k  |  Read:2.1M  |  Total:2.7M  |  effort:xhigh  |  💭 thinking
+🧮 ctx: Reused 195.8k  |  +Cache 539  |  Fresh 131  |  Out 192  |  base~37.6k (sys~4.6k · tools~16.7k · mcp+~16.3k)
+⊙ 5H 2:10 AM (3h 0m) 47% • 7DAY Tue 4:00 AM (4d 4h) 57%  |  +73/-82  |  ↑2↓1  |  Commits:127  |  ⏱ 2h 34m (68% API)  |  🕐 11:09 PM
+REPO $66.79  |  30D $2358.65  |  7D $1118.07  |  DAY $248.75  |  🔥 LIVE $9.99  |  $3.64/hr  |  Cache hit: 98%
 18 Dhū al-Ḥijjah 1447  |  Thu, Jun 4, 2026  |  🤖 Opus 4.8 $8.02 (61%) 11.4M ×59  |  Sonnet 4.6 $5.06 (39%) 10.7M ×91
+🔀 PR #13 · approved  |  🌿 ui-reorg  |  📦 owner/repo
 🕌 Fajr 3:20 AM ✓  |  Dhuhr 12:01 PM ✓  |  Asr 3:40 PM ✓  |  Maghrib 7:04 PM ✓  |  Isha 8:42 PM ✓
-📍 Lahore, Pakistan  |  Skills:15  |  MCP:3
+📍 Lahore, Pakistan  |  Plugins:15  |  Skills:118  |  MCP:3  |  v2.1.162
    caveman, superpowers, frontend-design, context7, claude-md-management
    typescript-lsp, security-guidance, claude-code-setup, atlassian, csharp-lsp
    remember, firecrawl, netlify-skills, impeccable, skill-creator
-🔌 atlassian, octa-portal, google-drive
+🔌 atlassian, google-drive, sentry
 ```
 
 ## Features
 
 | Line | Content |
 |------|---------|
-| 1 | **Launch dir → workspace** (FS-decoded, relative if subdir) · branch · git status · model · context bar |
-| 2 | Session tokens: In / Out / Write (cache) / Read (cache) / Total |
-| 3 | Rate limits (5H + 7DAY) with reset times · lines added/removed · commits · clock |
-| 4 | Costs: REPO / 30D / 7D / DAY · live session cost · burn rate/hr · cache hit % |
-| 5 | Islamic (Hijri) date · Gregorian date · per-model usage (cost, % share, tokens, call count) |
+| 1 | Session name · **launch dir → workspace** (relative if subdir) · branch · git status · model · ⚡fast · context bar (`used/max`) |
+| 1b | Session tokens: In / Out / Write (cache) / Read (cache) / Total · effort level · 💭 thinking |
+| 1c | **Live context-window breakdown**: Reused (cache) / +Cache / Fresh / Out · estimated base overhead (sys / tools / mcp+) |
+| 2 | Rate limits (5H + 7DAY) with reset times · lines ±  · ahead/behind remote · commits · session duration + API% · clock |
+| 3 | Costs: REPO (project + worktrees) / 30D / 7D / DAY · live session cost · burn rate/hr · cache hit % |
+| 4 | Islamic (Hijri) date · Gregorian date · per-model usage (cost, % share, tokens, call count) |
+| 5 | PR # + review state · worktree · repo owner/name · agent · output style · added dirs · vim mode *(each shown only when present)* |
 | 6 | Prayer times — colored: ✓ gray = passed · yellow = next (with countdown) · cyan = upcoming |
-| 7 | Location · Skills count · MCP count |
-| 8+ | Skill plugin names (5 per line, cyan) |
+| 7 | Location · Plugins count · Skills count · MCP count · Claude Code version |
+| 8+ | Plugin names (5 per line, cyan) |
 | 9+ | MCP server names (5 per line, magenta) — only if any configured |
 | +1 | Subagent breakdown by type (only when subagents spawned) |
 
@@ -75,9 +79,28 @@ The status line appears at the bottom of every session.
 
 ---
 
+## Context window breakdown
+
+The `🧮 ctx:` line decomposes the **current** context window from the last API call's cache structure:
+
+- **Reused** — `cache_read` tokens: the bulk reused from cache (system prompt + tools + MCP + memory + conversation history)
+- **+Cache** — `cache_creation` tokens newly written to cache this turn
+- **Fresh** — uncached new input tokens this turn
+- **Out** — output tokens of the last response
+- **base~** — estimated fixed overhead, measured from the **first** API call of the session (≈ system + tools + MCP + agents + memory loaded before your first prompt)
+
+The base estimate is further split:
+
+- `sys~4.6k` and `tools~16.7k` are Claude Code reference constants
+- `mcp+~` is the **measured remainder** (`base − sys − tools`) — i.e. MCP tools + custom agents + memory files
+
+> **Why estimates?** The exact per-category split (system / tools / MCP / agents / memory) that `/context` shows is **not exposed** to status line scripts — it's computed inside Claude Code ([feature request #15404](https://github.com/anthropics/claude-code/issues/15404)). The `base~` total and `mcp+~` remainder are real measurements; `sys`/`tools` are fixed reference values.
+
+---
+
 ## How costs work
 
-- **REPO** — current project, all time (scanned from `~/.claude/projects/<slug>/`)
+- **REPO** — current project **+ all its git worktrees**, all time (matches `<slug>` and `<slug>--worktrees-*` folders in `~/.claude/projects/`)
 - **30D / 7D / DAY** — all projects, rolling windows
 - **LIVE** — current session (from Claude Code's JSON)
 - **Burn/hr** — last 5 minutes extrapolated, session-scoped (won't inherit prior session rate)
