@@ -13,6 +13,7 @@ let raw = '';
 try { raw = fs.readFileSync(0, 'utf8'); } catch (_) {}
 let J = {};
 try { J = JSON.parse(raw); } catch (_) {}
+// DEBUG: dump full JSON once so we can inspect MCP fields — remove after
 
 const HOME = os.homedir();
 const SL_DIR = path.join(HOME, '.claude', 'statusline');
@@ -311,11 +312,30 @@ if ((!prayer || prayer.date !== todayStr) && loc.lat) {
 }
 
 // ── Plugins ──────────────────────────────────────────────────────────────────────
-let plugins = [];
+// ── Skills (enabledPlugins) + MCP servers (project or global settings) ───────────
+let skills = [];
 try {
   const s = JSON.parse(fs.readFileSync(path.join(HOME, '.claude', 'settings.json'), 'utf8'));
-  plugins = Object.entries(s.enabledPlugins || {}).filter(([, v]) => v === true).map(([k]) => k.split('@')[0]);
+  skills = Object.entries(s.enabledPlugins || {}).filter(([, v]) => v === true).map(([k]) => k.split('@')[0]);
 } catch (_) {}
+
+let mcpServers = [];
+// Try project .claude/settings.json (LAUNCH_DIR first, then DIR)
+for (const base of [LAUNCH_DIR, DIR]) {
+  if (mcpServers.length) break;
+  try {
+    const ps = JSON.parse(fs.readFileSync(path.join(base.replace(/\//g, path.sep), '.claude', 'settings.json'), 'utf8'));
+    const keys = Object.keys(ps.mcpServers || {});
+    if (keys.length) mcpServers = keys;
+  } catch (_) {}
+}
+// Fallback: global settings
+if (!mcpServers.length) {
+  try {
+    const gs = JSON.parse(fs.readFileSync(path.join(HOME, '.claude', 'settings.json'), 'utf8'));
+    mcpServers = Object.keys(gs.mcpServers || {});
+  } catch (_) {}
+}
 
 // ── Formatting helpers ────────────────────────────────────────────────────────────
 const fmtTok = (t) => t >= 1e6 ? (t / 1e6).toFixed(1) + 'M' : t >= 1000 ? (t / 1000).toFixed(1) + 'k' : String(t);
@@ -459,13 +479,23 @@ if (hasPrayer) {
   console.log('🕌 ' + parts.join(`${C.gray} | ${R}`));
 }
 
-// ── Line 6: location + plugin count ──────────────────────────────────────────────
+// ── Line 6: location + skills count + mcp count ──────────────────────────────────
 const locDisp = [loc.city, loc.country].filter(Boolean).join(', ') || 'Unknown';
-console.log(`📍 ${C.gray}${locDisp}${R} ${SEP} ${C.gray}Plugins:${R}${C.cyan}${plugins.length}${R}`);
+let L6 = `📍 ${C.gray}${locDisp}${R} ${SEP} ${C.gray}Skills:${R}${C.cyan}${skills.length}${R}`;
+if (mcpServers.length) L6 += ` ${SEP} ${C.gray}MCP:${R}${C.magenta}${mcpServers.length}${R}`;
+console.log(L6);
 
-// ── Line 7+: plugin names wrapped 5/line ────────────────────────────────────────
+// ── Line 7+: skill names wrapped 5/line ──────────────────────────────────────────
 const PER = 5;
-for (let i = 0; i < plugins.length; i += PER) {
-  const chunk = plugins.slice(i, i + PER).map((p) => `${C.teal}${p}${R}`).join(`${C.gray}, ${R}`);
+for (let i = 0; i < skills.length; i += PER) {
+  const chunk = skills.slice(i, i + PER).map((p) => `${C.teal}${p}${R}`).join(`${C.gray}, ${R}`);
   console.log('   ' + chunk);
+}
+
+// ── MCP server names (only if found) ────────────────────────────────────────────
+if (mcpServers.length) {
+  for (let i = 0; i < mcpServers.length; i += PER) {
+    const chunk = mcpServers.slice(i, i + PER).map((s) => `${C.magenta}${s}${R}`).join(`${C.gray}, ${R}`);
+    console.log('🔌 ' + (i === 0 ? '' : '   ') + chunk);
+  }
 }
