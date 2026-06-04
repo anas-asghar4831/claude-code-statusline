@@ -320,20 +320,17 @@ try {
 } catch (_) {}
 
 let mcpServers = [];
-// Try project .claude/settings.json (LAUNCH_DIR first, then DIR)
+// ~/.claude.json is the actual MCP config (settings.json is wrong per GH #4976)
+try {
+  const cj = JSON.parse(fs.readFileSync(path.join(HOME, '.claude.json'), 'utf8'));
+  mcpServers = Object.keys(cj.mcpServers || {});
+} catch (_) {}
+// Also merge project-level .mcp.json if present
 for (const base of [LAUNCH_DIR, DIR]) {
-  if (mcpServers.length) break;
   try {
-    const ps = JSON.parse(fs.readFileSync(path.join(base.replace(/\//g, path.sep), '.claude', 'settings.json'), 'utf8'));
-    const keys = Object.keys(ps.mcpServers || {});
-    if (keys.length) mcpServers = keys;
-  } catch (_) {}
-}
-// Fallback: global settings
-if (!mcpServers.length) {
-  try {
-    const gs = JSON.parse(fs.readFileSync(path.join(HOME, '.claude', 'settings.json'), 'utf8'));
-    mcpServers = Object.keys(gs.mcpServers || {});
+    const pm = JSON.parse(fs.readFileSync(path.join(base.replace(/\//g, path.sep), '.mcp.json'), 'utf8'));
+    const extra = Object.keys(pm.mcpServers || pm || {}).filter(k => !mcpServers.includes(k));
+    mcpServers = [...mcpServers, ...extra];
   } catch (_) {}
 }
 
