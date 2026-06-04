@@ -286,7 +286,7 @@ if (SESSION_ID) {
 
 // ── Git ───────────────────────────────────────────────────────────────────────
 const gitC = (args) => execFileSync('git', args, { cwd: DIR, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-let gitBranch = '', gitCommits = '0', gitIcon = '✅', gitAhead = 0, gitBehind = 0;
+let gitBranch = '', gitCommits = '0', gitIcon = '✅', gitAhead = 0, gitBehind = 0, gitSubmodules = 0, gitSubDirty = false;
 try {
   const branch = gitC(['branch', '--show-current']);
   if (branch) {
@@ -297,6 +297,18 @@ try {
       const ab = gitC(['rev-list', '--count', '--left-right', 'HEAD...@{u}']);
       const parts = ab.split('\t');
       gitAhead = parseInt(parts[0]) || 0; gitBehind = parseInt(parts[1]) || 0;
+    } catch (_) {}
+    try {
+      const gitRoot = gitC(['rev-parse', '--show-toplevel']).replace(/\//g, path.sep);
+      const gmPath = path.join(gitRoot, '.gitmodules');
+      if (fs.existsSync(gmPath)) {
+        const gm = fs.readFileSync(gmPath, 'utf8');
+        gitSubmodules = (gm.match(/^\[submodule /mg) || []).length;
+        if (gitSubmodules > 0) {
+          const smStatus = gitC(['submodule', 'status']);
+          gitSubDirty = /^[+\-U]/m.test(smStatus);
+        }
+      }
     } catch (_) {}
   }
 } catch (_) {}
@@ -529,7 +541,12 @@ if (PR_NUM)    {
   const stateColor = PR_STATE === 'approved' ? C.green : PR_STATE === 'changes_requested' ? C.red : PR_STATE === 'draft' ? C.gray : C.yellow;
   L5parts.push(`🔀 ${C.blue}PR #${PR_NUM}${R}${PR_STATE ? ` ${stateColor}· ${PR_STATE}${R}` : ''}`);
 }
-if (WT_NAME)   L5parts.push(`🌿 ${C.teal}${WT_NAME}${WT_BRANCH ? ` (${WT_BRANCH})` : ''}${R}`);
+if (WT_NAME) {
+  const smSuffix = gitSubmodules > 0
+    ? ` ${SEP} ${gitSubDirty ? C.orange : C.teal}⧉ ${gitSubmodules} sub${gitSubDirty ? ' ⚠' : ''}${R}`
+    : '';
+  L5parts.push(`🌿 ${C.teal}${WT_NAME}${WT_BRANCH ? ` (${WT_BRANCH})` : ''}${R}${smSuffix}`);
+}
 if (REPO_OWNER && REPO_NAME) L5parts.push(`📦 ${C.gray}${REPO_OWNER}/${REPO_NAME}${R}`);
 if (AGENT_NAME) L5parts.push(`🤖 ${C.magenta}agent:${AGENT_NAME}${R}`);
 if (OUTPUT_STYLE && OUTPUT_STYLE !== 'default') L5parts.push(`🎨 ${C.gray}${OUTPUT_STYLE}${R}`);
