@@ -313,11 +313,40 @@ if ((!prayer || prayer.date !== todayStr) && loc.lat) {
 
 // ── Plugins ──────────────────────────────────────────────────────────────────────
 // ── Skills (enabledPlugins) + MCP servers (project or global settings) ───────────
-let skills = [];
+// ── Plugins (enabledPlugins package names) ───────────────────────────────────────
+let plugins = [];
 try {
   const s = JSON.parse(fs.readFileSync(path.join(HOME, '.claude', 'settings.json'), 'utf8'));
-  skills = Object.entries(s.enabledPlugins || {}).filter(([, v]) => v === true).map(([k]) => k.split('@')[0]);
+  plugins = Object.entries(s.enabledPlugins || {}).filter(([, v]) => v === true).map(([k]) => k.split('@')[0]);
 } catch (_) {}
+
+// ── Actual skill count (unique names from plugin cache + user skills dir) ────────
+function countSkills() {
+  const seen = new Set();
+  const skip = new Set(['.orphaned_at', 'CLAUDE.md']);
+  // user skills dir
+  try {
+    fs.readdirSync(path.join(HOME, '.claude', 'skills'), { withFileTypes: true })
+      .forEach(e => { if (!skip.has(e.name)) seen.add(e.name); });
+  } catch (_) {}
+  // plugin cache skill dirs
+  function walkPlugins(dir, depth) {
+    if (depth > 4) return;
+    try {
+      fs.readdirSync(dir, { withFileTypes: true }).forEach(e => {
+        if (e.isDirectory() && e.name === 'skills') {
+          try {
+            fs.readdirSync(path.join(dir, 'skills'), { withFileTypes: true })
+              .forEach(s => { if (!skip.has(s.name)) seen.add(s.name); });
+          } catch (_) {}
+        } else if (e.isDirectory()) walkPlugins(path.join(dir, e.name), depth + 1);
+      });
+    } catch (_) {}
+  }
+  walkPlugins(path.join(HOME, '.claude', 'plugins', 'cache'), 0);
+  return seen.size;
+}
+const skillCount = countSkills();
 
 let mcpServers = [];
 // ~/.claude.json is the actual MCP config (settings.json is wrong per GH #4976)
@@ -476,16 +505,17 @@ if (hasPrayer) {
   console.log('🕌 ' + parts.join(`${C.gray} | ${R}`));
 }
 
-// ── Line 6: location + skills count + mcp count ──────────────────────────────────
+// ── Line 6: location + plugins + skills + mcp ────────────────────────────────────
 const locDisp = [loc.city, loc.country].filter(Boolean).join(', ') || 'Unknown';
-let L6 = `📍 ${C.gray}${locDisp}${R} ${SEP} ${C.gray}Skills:${R}${C.cyan}${skills.length}${R}`;
+let L6 = `📍 ${C.gray}${locDisp}${R} ${SEP} ${C.gray}Plugins:${R}${C.cyan}${plugins.length}${R}`;
+L6 += ` ${SEP} ${C.gray}Skills:${R}${C.green}${skillCount}${R}`;
 if (mcpServers.length) L6 += ` ${SEP} ${C.gray}MCP:${R}${C.magenta}${mcpServers.length}${R}`;
 console.log(L6);
 
-// ── Line 7+: skill names wrapped 5/line ──────────────────────────────────────────
+// ── Line 7+: plugin names wrapped 5/line ─────────────────────────────────────────
 const PER = 5;
-for (let i = 0; i < skills.length; i += PER) {
-  const chunk = skills.slice(i, i + PER).map((p) => `${C.teal}${p}${R}`).join(`${C.gray}, ${R}`);
+for (let i = 0; i < plugins.length; i += PER) {
+  const chunk = plugins.slice(i, i + PER).map((p) => `${C.teal}${p}${R}`).join(`${C.gray}, ${R}`);
   console.log('   ' + chunk);
 }
 
