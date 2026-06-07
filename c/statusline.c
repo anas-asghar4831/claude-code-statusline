@@ -37,6 +37,16 @@
 static long NOW;
 static char HOME[1024], SL_DIR[1100], PROJECTS_DIR[1100];
 
+// ── profiler (STATUSLINE_PROF=1 → phase timings to stderr) ──
+static int PROF_ON; static double PROF_T0, PROF_LAST;
+#ifdef _WIN32
+static double qpc_ms(void){ LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (double)c.QuadPart * 1000.0 / (double)f.QuadPart; }
+#else
+#include <sys/time.h>
+static double qpc_ms(void){ struct timeval tv; gettimeofday(&tv, NULL); return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0; }
+#endif
+static void PROF(const char *l){ if(!PROF_ON) return; double n = qpc_ms(); fprintf(stderr, "[prof] %-16s %7.2f ms  (cum %7.2f)\n", l, n - PROF_LAST, n - PROF_T0); PROF_LAST = n; }
+
 // ── ring buffers (so multiple fmt calls in one printf don't clobber) ──────────
 static char g_ring[48][96];
 static int g_ringi;
@@ -112,6 +122,49 @@ static char *run_cmd(const char *cmd) {
   buf[len] = 0; pclose(p); rtrim(buf); return buf;
 }
 #endif
+
+// ── async command: spawn all, then collect — runs subprocesses concurrently ──
+typedef struct {
+#ifdef _WIN32
+  HANDLE proc, rd;
+#else
+  FILE *fp;
+#endif
+} acmd;
+#ifdef _WIN32
+static void ac_spawn(acmd *a, const char *cmd) {
+  a->proc = NULL; a->rd = NULL;
+  SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+  HANDLE rd, wr; if (!CreatePipe(&rd, &wr, &sa, 0)) return;
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  HANDLE nin = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+  HANDLE nerr = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+  STARTUPINFOA si = { sizeof(si) }; si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr; si.hStdError = nerr; si.hStdInput = nin;
+  PROCESS_INFORMATION pi; char *mut = strdup(cmd);
+  BOOL ok = CreateProcessA(NULL, mut, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  free(mut); CloseHandle(wr);
+  if (nin != INVALID_HANDLE_VALUE) CloseHandle(nin); if (nerr != INVALID_HANDLE_VALUE) CloseHandle(nerr);
+  if (!ok) { CloseHandle(rd); return; }
+  CloseHandle(pi.hThread); a->proc = pi.hProcess; a->rd = rd;
+}
+static char *ac_collect(acmd *a) {
+  if (!a->rd) return NULL;
+  size_t cap = 4096, len = 0; char *buf = malloc(cap); DWORD n;
+  while (ReadFile(a->rd, buf + len, (DWORD)(cap - len), &n, NULL) && n > 0) { len += n; if (len == cap) { cap *= 2; buf = realloc(buf, cap); } }
+  buf[len] = 0; CloseHandle(a->rd);
+  if (a->proc) { WaitForSingleObject(a->proc, INFINITE); CloseHandle(a->proc); }
+  rtrim(buf); return buf;
+}
+#else
+static void ac_spawn(acmd *a, const char *cmd) { a->fp = popen(cmd, "r"); } // popen starts process immediately → concurrent until collected
+static char *ac_collect(acmd *a) {
+  if (!a->fp) return NULL;
+  size_t cap = 4096, len = 0; char *buf = malloc(cap);
+  size_t r; while ((r = fread(buf + len, 1, cap - len, a->fp)) > 0) { len += r; if (len == cap) { cap *= 2; buf = realloc(buf, cap); } }
+  buf[len] = 0; pclose(a->fp); rtrim(buf); return buf;
+}
+#endif
 #ifdef _WIN32
 static int file_exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
 static int is_dir(const char *path) { DWORD a = GetFileAttributesA(path); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
@@ -119,6 +172,18 @@ static int is_dir(const char *path) { DWORD a = GetFileAttributesA(path); return
 static int file_exists(const char *path) { struct stat st; return stat(path, &st) == 0; }
 static int is_dir(const char *path) { struct stat st; return stat(path, &st) == 0 && (st.st_mode & S_IFDIR); }
 #endif
+static long mtime_of(const char *path) { struct stat st; return stat(path, &st) == 0 ? (long)st.st_mtime : 0; }
+// walk up from start looking for .git (dir or file) → repo root. No subprocess.
+static int find_git_root(const char *start, char *out) {
+  char cur[1024]; snprintf(cur, sizeof(cur), "%s", start);
+  for (;;) {
+    char dotgit[1100]; snprintf(dotgit, sizeof(dotgit), "%s/.git", cur);
+    if (file_exists(dotgit)) { snprintf(out, 1024, "%s", cur); return 1; }
+    char *slash = strrchr(cur, '/'); if (!slash) break;
+    *slash = 0; if (!*cur) break; // reached root
+  }
+  return 0;
+}
 // ── fast directory iterator — Win32 FindFirstFile yields name+isdir+mtime inline
 //    (no per-entry stat/GetFileAttributes), POSIX falls back to readdir+stat. ──
 typedef struct {
@@ -389,6 +454,7 @@ static void decode_launch(const char *transcript, char *out) {
 }
 
 int main(void) {
+  PROF_ON = getenv("STATUSLINE_PROF") != NULL; PROF_T0 = PROF_LAST = qpc_ms();
   NOW = (long)time(NULL);
   const char *up = getenv("USERPROFILE"); if (!up) up = getenv("HOME"); if (!up) up = ".";
   snprintf(HOME, sizeof(HOME), "%s", up); slashfix(HOME);
@@ -397,6 +463,7 @@ int main(void) {
 
   char *raw = read_stdin();
   J = yyjson_read(raw, strlen(raw), 0);
+  PROF("stdin+parse");
 
   // ── field extraction ──
   const char *MODEL = gstr("/model/display_name", "?");
@@ -504,6 +571,7 @@ int main(void) {
     write_cache_raw("cost-cache.json", out);
   }
   if (cc) yyjson_doc_free(cc);
+  PROF("costs");
 
   // ── burn rate (5min window, session-scoped 30s cache) ──
   double burn_tpm = 0, burn_cph = 0;
@@ -531,6 +599,7 @@ int main(void) {
     write_cache_raw("burn-cache.json", out);
   }
 
+  PROF("burn");
   // ── session tokens + per-model + ctx breakdown ──
   sessctx sx = {0};
   if (*TRANSCRIPT && file_exists(TRANSCRIPT)) file_usage(TRANSCRIPT, cb_sess, &sx);
@@ -541,53 +610,50 @@ int main(void) {
   long cbCr = CU_CR ? CU_CR : (sx.haveLast ? sx.lastCr : 0);
   long cbOut = CU_OUT ? CU_OUT : (sx.haveLast ? sx.lastOut : 0);
   long baseOverhead = sx.haveFirst ? sx.firstBase : 0;
+  PROF("session");
 
   // ── git ──
-  // PERF: one `status --porcelain=v2 --branch` yields branch + ahead/behind + dirty
-  //       in a single spawn (replaces branch/status/rev-list-left-right = 3 calls).
+  // PERF: (1) find .git root ourselves (no rev-parse spawn, no spawn at all when not a
+  //   repo). (2) spawn status-v2 + rev-list + submodule CONCURRENTLY then collect, so
+  //   wall time ≈ one git spawn instead of 4 sequential. (3) --no-optional-locks skips
+  //   the index-refresh write. status --porcelain=v2 --branch carries branch+ab+dirty.
   char gitBranch[256] = "", gitCommits[64] = "0"; const char *gitIcon = "✅";
   long gitAhead = 0, gitBehind = 0, gitSubmodules = 0; int gitSubDirty = 0;
   {
-    char cmd[1400];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" status --porcelain=v2 --branch %s", CWD, NULDEV);
-    char *stv = run_cmd(cmd);
-    int isRepo = 0, dirty = 0;
-    if (stv && *stv) {
-      char *save = NULL;
-      for (char *line = strtok_r(stv, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        if (line[0] == '#') {
-          if (!strncmp(line, "# branch.head ", 14)) { isRepo = 1; const char *h = line + 14;
-            if (strcmp(h, "(detached)")) snprintf(gitBranch, sizeof(gitBranch), "%s", h); }
-          else if (!strncmp(line, "# branch.ab ", 12)) { long a = 0, b = 0; sscanf(line + 12, "+%ld -%ld", &a, &b); gitAhead = a; gitBehind = b; }
-        } else if (line[0]) { dirty = 1; }
-      }
-    }
-    free(stv);
-    if (isRepo && *gitBranch) {
-      if (dirty) gitIcon = "⚠️";
-      snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-list --count HEAD %s", CWD, NULDEV);
-      char *cnt = run_cmd(cmd); if (cnt && *cnt) snprintf(gitCommits, sizeof(gitCommits), "%s", cnt); free(cnt);
-      snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --show-toplevel %s", CWD, NULDEV);
-      char *top = run_cmd(cmd);
-      if (top && *top) {
-        char gm[1200]; snprintf(gm, sizeof(gm), "%s/.gitmodules", top);
-        char *gmc = read_file(gm, NULL);
-        if (gmc) {
-          // count occurrences of "[submodule " at line start
-          char *p = gmc; if (!strncmp(p, "[submodule ", 11)) gitSubmodules++;
-          while ((p = strstr(p, "\n[submodule "))) { gitSubmodules++; p += 1; }
-          free(gmc);
-          if (gitSubmodules > 0) {
-            snprintf(cmd, sizeof(cmd), "git -C \"%s\" submodule status %s", CWD, NULDEV);
-            char *ss = run_cmd(cmd);
-            if (ss) { for (char *q = ss; *q; ) { if (*q=='+'||*q=='-'||*q=='U') { gitSubDirty = 1; break; } char *nl = strchr(q, '\n'); if (!nl) break; q = nl + 1; } free(ss); }
-          }
+    char gitroot[1024];
+    if (find_git_root(CWD, gitroot)) {
+      // pre-read .gitmodules (cheap file read) to decide if submodule spawn is needed
+      char gm[1200]; snprintf(gm, sizeof(gm), "%s/.gitmodules", gitroot);
+      char *gmc = read_file(gm, NULL);
+      if (gmc) { char *p = gmc; if (!strncmp(p, "[submodule ", 11)) gitSubmodules++;
+        while ((p = strstr(p, "\n[submodule "))) { gitSubmodules++; p += 1; } free(gmc); }
+      char ca[1400], cb[1400], cc2[1400];
+      snprintf(ca, sizeof(ca), "git --no-optional-locks -C \"%s\" status --porcelain=v2 --branch %s", CWD, NULDEV);
+      snprintf(cb, sizeof(cb), "git -C \"%s\" rev-list --count HEAD %s", CWD, NULDEV);
+      acmd A, B, C; ac_spawn(&A, ca); ac_spawn(&B, cb);
+      if (gitSubmodules > 0) { snprintf(cc2, sizeof(cc2), "git -C \"%s\" submodule status %s", CWD, NULDEV); ac_spawn(&C, cc2); }
+      char *stv = ac_collect(&A), *cnt = ac_collect(&B), *ss = gitSubmodules > 0 ? ac_collect(&C) : NULL;
+      int dirty = 0;
+      if (stv && *stv) {
+        char *save = NULL;
+        for (char *line = strtok_r(stv, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+          if (line[0] == '#') {
+            if (!strncmp(line, "# branch.head ", 14)) { const char *h = line + 14; if (strcmp(h, "(detached)")) snprintf(gitBranch, sizeof(gitBranch), "%s", h); }
+            else if (!strncmp(line, "# branch.ab ", 12)) { long a = 0, b = 0; sscanf(line + 12, "+%ld -%ld", &a, &b); gitAhead = a; gitBehind = b; }
+          } else if (line[0]) { dirty = 1; }
         }
       }
-      free(top);
+      // match JS: only surface commits/dirty/ab/submodule when a branch is shown (non-detached)
+      if (*gitBranch) {
+        if (dirty) gitIcon = "⚠️";
+        if (cnt && *cnt) snprintf(gitCommits, sizeof(gitCommits), "%s", cnt);
+        if (ss) { for (char *q = ss; *q; ) { if (*q=='+'||*q=='-'||*q=='U') { gitSubDirty = 1; break; } char *nl = strchr(q, '\n'); if (!nl) break; q = nl + 1; } }
+      } else { gitAhead = 0; gitBehind = 0; }
+      free(stv); free(cnt); free(ss);
     }
   }
 
+  PROF("git");
   // ── launch dir ──
   char LAUNCH_DIR[1024];
   if (*PROJECT_DIR) snprintf(LAUNCH_DIR, sizeof(LAUNCH_DIR), "%s", PROJECT_DIR);
@@ -701,6 +767,7 @@ int main(void) {
     }
   }
 
+  PROF("launch+loc+pray");
   // ── plugins / skills / mcp ──
   vec plugins = {0};
   { char path[1200]; snprintf(path, sizeof(path), "%s/.claude/settings.json", HOME);
@@ -713,17 +780,24 @@ int main(void) {
         yyjson_doc_free(d); }
       free(buf); } }
 
-  // skills count
-  int skillCount = 0;
-  { sitem *skills = NULL;
+  // skills count — cached, keyed by plugins/cache dir mtime (the 531-dir walk is the
+  // single most expensive non-git step; invalidate when a plugin is added/removed).
+  int skillCount = -1;
+  char cacheDir[1200]; snprintf(cacheDir, sizeof(cacheDir), "%s/.claude/plugins/cache", HOME);
+  long pcMtime = mtime_of(cacheDir);
+  yyjson_doc *skc = read_cache_copy("skill-cache.json");
+  if (skc) { yyjson_val *r = yyjson_doc_get_root(skc);
+    long dmt = (long)yyjson_get_num(yyjson_obj_get(r, "dmt"));
+    if (dmt == pcMtime) skillCount = (int)yyjson_get_num(yyjson_obj_get(r, "count"));
+    yyjson_doc_free(skc); }
+  if (skillCount < 0) {
+    sitem *skills = NULL;
     char sdir[1200]; snprintf(sdir, sizeof(sdir), "%s/.claude/skills", HOME);
     dirit d; const char *nm; int isdir;
     if (di_open(&d, sdir)) { while (di_next(&d, &nm, &isdir, NULL)) { if (!strcmp(nm,".orphaned_at")||!strcmp(nm,"CLAUDE.md")) continue; set_add(&skills, nm); } di_close(&d); }
-    // walk plugins/cache depth<=4 for "skills" dirs
-    char cache[1200]; snprintf(cache, sizeof(cache), "%s/.claude/plugins/cache", HOME);
     typedef struct { char path[1600]; int depth; } qn;
     qn *stack = malloc(4096 * sizeof(qn)); int sp = 0;
-    snprintf(stack[sp].path, sizeof(stack[sp].path), "%s", cache); stack[sp].depth = 0; sp++;
+    snprintf(stack[sp].path, sizeof(stack[sp].path), "%s", cacheDir); stack[sp].depth = 0; sp++;
     while (sp > 0) { qn cur = stack[--sp]; if (cur.depth > 4) continue;
       dirit dd; if (!di_open(&dd, cur.path)) continue;
       const char *en; int eisdir;
@@ -732,7 +806,11 @@ int main(void) {
         if (!strcmp(en, "skills")) { dirit sd; const char *sn; int sis; if (di_open(&sd, full)) { while (di_next(&sd, &sn, &sis, NULL)) { if (!strcmp(sn,".orphaned_at")||!strcmp(sn,"CLAUDE.md")) continue; set_add(&skills, sn); } di_close(&sd); } }
         else if (sp < 4096) { snprintf(stack[sp].path, sizeof(stack[sp].path), "%s", full); stack[sp].depth = cur.depth + 1; sp++; } }
       di_close(&dd); }
-    skillCount = HASH_COUNT(skills); set_free(&skills); free(stack); }
+    skillCount = HASH_COUNT(skills); set_free(&skills); free(stack);
+    char out[128]; snprintf(out, sizeof(out), "{\"dmt\":%ld,\"count\":%d}", pcMtime, skillCount);
+    write_cache_raw("skill-cache.json", out);
+  }
+  PROF("plugins+skills");
 
   // mcp servers
   vec mcp = {0};
@@ -750,6 +828,7 @@ int main(void) {
       if (ms && yyjson_is_obj(ms)) { yyjson_val *k; yyjson_obj_iter it; yyjson_obj_iter_init(ms, &it); while ((k = yyjson_obj_iter_next(&it))) { const char *nm = yyjson_get_str(k); if (nm && !vec_has(&mcp, nm)) vec_push(&mcp, nm); } }
       yyjson_doc_free(d); } free(buf); }
 
+  PROF("mcp");
   // ── subagents ──
   int subCount = 0;
   typedef struct { char type[96]; int count; double cost; } sub_t;
@@ -802,6 +881,7 @@ int main(void) {
     free(stack);
   }
 
+  PROF("subagents");
   // ════════════════════════════════════════ OUTPUT ════════════════════════════════
   // context bar
   int filled = PCT / 10; if (filled > 10) filled = 10; if (filled < 0) filled = 0;
@@ -960,5 +1040,6 @@ int main(void) {
     for (int j = i; j < i + 5 && j < mcp.n; j++) { if (j > i) strcat(line, C_gray ", " R); char t[256]; snprintf(t, sizeof(t), C_magenta "%s" R, mcp.v[j]); strcat(line, t); }
     puts(line); }
 
+  PROF("output");
   return 0;
 }

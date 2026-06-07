@@ -9,17 +9,21 @@ warm and cold.
 - Win32 `FindFirstFile` yields name + is-dir + mtime inline — no per-entry `stat` syscall
   (Node parity via one directory enumeration).
 - `CreateProcess` spawns git directly (no `cmd.exe` shell per call).
-- `git status --porcelain=v2 --branch` collapses branch + ahead/behind + dirty into one
-  spawn (6 git calls → 4).
+- **Self-walk for the `.git` root** (no `rev-parse` spawn; zero git spawns when not in a repo).
+- **Concurrent git spawns** — `status --porcelain=v2 --branch` + `rev-list --count` +
+  `submodule status` launched together, then collected → wall time ≈ one spawn, not four.
+- `--no-optional-locks` on status skips the index-refresh write.
+- **Skill-count cache** keyed by the `plugins/cache` dir mtime — the 531-dir walk runs only
+  when a plugin is added/removed (was ~28 ms every render).
 
 ## Performance (this machine, 360MB / 1252 JSONL)
-| | C | Node |
-|---|---|---|
-| warm (cached, real repo) | ~173 ms | ~284 ms |
-| cold (full cost re-parse) | ~1.4 s | ~2.5 s |
+| | C | Node | speedup |
+|---|---|---|---|
+| warm (cached, real repo) | ~77 ms | ~290 ms | 3.8x |
+| cold (full cost re-parse) | ~1.56 s | ~3.1 s | 2.0x |
 
-The warm floor is dominated by the remaining git subprocess spawns (~40 ms each), paid by
-both implementations.
+Internal compute is ~2 ms; the warm floor is `git status` itself (~50 ms, the OS/git cost
+any tool pays). Profile with `STATUSLINE_PROF=1` (phase timings to stderr).
 
 ## Build
 ```bash
