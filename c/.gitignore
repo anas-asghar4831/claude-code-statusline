@@ -1,0 +1,6 @@
+statusline.exe
+*.o
+*.obj
+mock*.json
+out_*.txt
+o_*.txt
