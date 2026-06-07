@@ -278,7 +278,9 @@ typedef struct {
 #else
   DIR *d; char base[2048];
 #endif
+  long _sz; // size of last entry returned by di_next (inline from FindFirstFile/stat)
 } dirit;
+static long di_size(dirit *it) { return it->_sz; }
 static int di_open(dirit *it, const char *path) {
 #ifdef _WIN32
   char pat[2048]; snprintf(pat, sizeof(pat), "%s\\*", path);
@@ -297,6 +299,7 @@ static int di_next(dirit *it, const char **name, int *isdir, long *mtime) {
     const char *n = it->fd.cFileName;
     if (!strcmp(n, ".") || !strcmp(n, "..")) continue;
     *name = n; *isdir = (it->fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+    it->_sz = (long)(((uint64_t)it->fd.nFileSizeHigh << 32) | it->fd.nFileSizeLow);
     if (mtime) { ULARGE_INTEGER u; u.LowPart = it->fd.ftLastWriteTime.dwLowDateTime; u.HighPart = it->fd.ftLastWriteTime.dwHighDateTime;
       *mtime = (long)((u.QuadPart - 116444736000000000ULL) / 10000000ULL); }
     return 1;
@@ -307,7 +310,7 @@ static int di_next(dirit *it, const char **name, int *isdir, long *mtime) {
     if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
     char full[2200]; snprintf(full, sizeof(full), "%s/%s", it->base, e->d_name);
     struct stat st; if (stat(full, &st) != 0) continue;
-    *name = e->d_name; *isdir = (st.st_mode & S_IFDIR) ? 1 : 0; if (mtime) *mtime = (long)st.st_mtime;
+    *name = e->d_name; *isdir = (st.st_mode & S_IFDIR) ? 1 : 0; it->_sz = (long)st.st_size; if (mtime) *mtime = (long)st.st_mtime;
     return 1;
   }
   return 0;
@@ -379,22 +382,6 @@ static double row_cost(const urow *r, const double p[4]) {
   return (r->in * p[0] + r->out * p[1] + r->cw * p[2] + r->cr * p[3]) / 1e6;
 }
 
-// recursive .jsonl walk with optional max-age filter (days). 0 = no filter.
-static void walk_jsonl(const char *dir, int maxAgeDays, void (*onfile)(const char *, void *), void *ctx) {
-  dirit it; if (!di_open(&it, dir)) return;
-  double cutoff = maxAgeDays ? ((double)NOW - (double)maxAgeDays * 86400.0) : 0;
-  const char *name; int isdir; long mt; char full[2048];
-  while (di_next(&it, &name, &isdir, &mt)) {
-    snprintf(full, sizeof(full), "%s/%s", dir, name);
-    if (isdir) { walk_jsonl(full, maxAgeDays, onfile, ctx); continue; }
-    size_t ln = strlen(name);
-    if (ln < 6 || strcmp(name + ln - 6, ".jsonl")) continue;
-    if (cutoff && (double)mt < cutoff) continue;
-    onfile(full, ctx);
-  }
-  di_close(&it);
-}
-
 // ── cache read/write (cost-cache etc) ──────────────────────────────────────────
 static yyjson_doc *read_cache(const char *name) {
   char path[1200]; snprintf(path, sizeof(path), "%s/%s", SL_DIR, name);
@@ -408,9 +395,226 @@ static yyjson_doc *read_cache_copy(const char *name) {
   char *buf = read_file(path, NULL); if (!buf) return NULL;
   yyjson_doc *d = yyjson_read(buf, strlen(buf), 0); free(buf); return d;
 }
-static void write_cache_raw(const char *name, const char *json) {
-  char path[1200]; snprintf(path, sizeof(path), "%s/%s", SL_DIR, name);
-  FILE *f = fopen(path, "wb"); if (!f) return; fputs(json, f); fclose(f);
+// atomic write: temp (pid-tagged) → rename over target. Safe across concurrent sessions.
+static void write_file_atomic(const char *name, const void *data, size_t len) {
+  unsigned pid =
+#ifdef _WIN32
+    (unsigned)GetCurrentProcessId();
+#else
+    (unsigned)getpid();
+#endif
+  char tmp[1300], dst[1200];
+  snprintf(dst, sizeof(dst), "%s/%s", SL_DIR, name);
+  snprintf(tmp, sizeof(tmp), "%s/%s.tmp.%u", SL_DIR, name, pid);
+  FILE *f = fopen(tmp, "wb"); if (!f) return;
+  size_t w = fwrite(data, 1, len, f); fclose(f);
+  if (w != len) { remove(tmp); return; }
+#ifdef _WIN32
+  if (!MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING)) remove(tmp);
+#else
+  if (rename(tmp, dst) != 0) remove(tmp);
+#endif
+}
+static void write_cache_raw(const char *name, const char *json) { write_file_atomic(name, json, strlen(json)); }
+
+// ═══ incremental cost cache: binary format, mmap read, threaded build, atomic write ═══
+// Re-parse only changed JSONL files; reuse cached parsed rows for the rest. Rows store raw
+// token counts (pricing applied at aggregation, so model switches stay correct) + the ISO
+// timestamp (so the rolling day/week/month windows recompute exactly). Global dedup by a
+// 64-bit hash of the request id preserves the ~52% cross-file duplicate removal.
+typedef struct { uint64_t idh; uint32_t in, out, cw, cr; char ts[20]; } crow;
+typedef struct { char path[600]; long mt, sz; crow *rows; uint32_t nrows; int isRepo, owned; } cfile;
+
+static uint64_t fnv1a(const char *s) { uint64_t h = 0xcbf29ce484222325ULL; for (; *s; s++) { h ^= (unsigned char)*s; h *= 0x100000001b3ULL; } return h; }
+
+// open-address uint64 set (idh==0 means "no id" → never deduped)
+typedef struct { uint64_t *k; size_t cap, n; } u64set;
+static void u64init(u64set *s, size_t hint) { size_t c = 16; while (c < hint * 2) c <<= 1; s->k = calloc(c, 8); s->cap = c; s->n = 0; }
+static int u64add(u64set *s, uint64_t key) {
+  if (key == 0) return 1;
+  if ((s->n + 1) * 4 >= s->cap * 3) { size_t nc = s->cap << 1; uint64_t *nk = calloc(nc, 8);
+    for (size_t i = 0; i < s->cap; i++) { uint64_t v = s->k[i]; if (v) { size_t j = v & (nc - 1); while (nk[j]) j = (j + 1) & (nc - 1); nk[j] = v; } }
+    free(s->k); s->k = nk; s->cap = nc; }
+  size_t i = key & (s->cap - 1); while (s->k[i]) { if (s->k[i] == key) return 0; i = (i + 1) & (s->cap - 1); } s->k[i] = key; s->n++; return 1;
+}
+
+// parse one JSONL file → malloc'd crow[] (deduped within file). caller frees.
+static crow *parse_cost_file(const char *path, uint32_t *outn) {
+  *outn = 0; char *buf = read_file(path, NULL); if (!buf) return NULL;
+  crow *rows = NULL; size_t cap = 0, cnt = 0; u64set local; u64init(&local, 128);
+  char *save = NULL;
+  for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    if (!strstr(line, "\"assistant\"")) continue;
+    yyjson_doc *d = yyjson_read(line, strlen(line), 0); if (!d) continue;
+    yyjson_val *o = yyjson_doc_get_root(d);
+    const char *type = yyjson_get_str(yyjson_obj_get(o, "type"));
+    if (!type || strcmp(type, "assistant")) { yyjson_doc_free(d); continue; }
+    yyjson_val *msg = yyjson_obj_get(o, "message");
+    yyjson_val *u = msg ? yyjson_obj_get(msg, "usage") : NULL;
+    if (!u) { yyjson_doc_free(d); continue; }
+    const char *id = msg ? yyjson_get_str(yyjson_obj_get(msg, "id")) : NULL;
+    if (!id) id = yyjson_get_str(yyjson_obj_get(o, "requestId"));
+    if (!id) id = yyjson_get_str(yyjson_obj_get(o, "uuid"));
+    uint64_t idh = (id && *id) ? fnv1a(id) : 0;
+    if (!u64add(&local, idh)) { yyjson_doc_free(d); continue; }
+    if (cnt == cap) { cap = cap ? cap * 2 : 128; rows = realloc(rows, cap * sizeof(crow)); }
+    crow *r = &rows[cnt++];
+    r->idh = idh;
+    r->in = (uint32_t)yyjson_get_num(yyjson_obj_get(u, "input_tokens"));
+    r->out = (uint32_t)yyjson_get_num(yyjson_obj_get(u, "output_tokens"));
+    r->cw = (uint32_t)yyjson_get_num(yyjson_obj_get(u, "cache_creation_input_tokens"));
+    r->cr = (uint32_t)yyjson_get_num(yyjson_obj_get(u, "cache_read_input_tokens"));
+    const char *ts = yyjson_get_str(yyjson_obj_get(o, "timestamp"));
+    r->ts[0] = 0; if (ts) { int k = 0; for (; ts[k] && k < 19; k++) { if (ts[k] == '.' || ts[k] == 'Z') break; r->ts[k] = ts[k]; } r->ts[k] = 0; }
+    yyjson_doc_free(d);
+  }
+  free(buf); free(local.k); *outn = (uint32_t)cnt; return rows;
+}
+
+// cached-file lookup (path → mt/sz/rows-pointer-into-mmap)
+typedef struct { char *path; long mt, sz; const unsigned char *rows; uint32_t nrows; UT_hash_handle hh; } centry;
+
+// mmap a file read-only (leaked until process exit). returns base + len.
+static const unsigned char *map_ro(const char *path, size_t *len) {
+#ifdef _WIN32
+  HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (f == INVALID_HANDLE_VALUE) return NULL;
+  LARGE_INTEGER sz; if (!GetFileSizeEx(f, &sz) || sz.QuadPart == 0) { CloseHandle(f); return NULL; }
+  HANDLE m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL); if (!m) { CloseHandle(f); return NULL; }
+  void *p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+  *len = (size_t)sz.QuadPart; return (const unsigned char *)p; // handles leaked (short-lived)
+#else
+  long n; char *b = read_file(path, &n); *len = b ? (size_t)n : 0; return (const unsigned char *)b;
+#endif
+}
+
+// threaded parse of the cache-miss files
+typedef struct { cfile *files; int *idx; int start, end; } pjob;
+#ifdef _WIN32
+static DWORD WINAPI parse_worker(LPVOID vp) { pjob *j = vp; for (int i = j->start; i < j->end; i++) { cfile *cf = &j->files[j->idx[i]]; cf->rows = parse_cost_file(cf->path, &cf->nrows); cf->owned = 1; } return 0; }
+#endif
+
+// the whole incremental cost computation. writes cost-index.bin atomically.
+static void compute_costs(const char *CWD, const char *todayISO, const char *weekISO, const char *monthISO,
+                          double *o_repo, double *o_day, double *o_week, double *o_month) {
+  char repoRoot[1024]; snprintf(repoRoot, sizeof(repoRoot), "%s", CWD);
+  char *wt = strstr(repoRoot, "/.worktrees/"); if (wt) *wt = 0;
+  char repoSlug[1024]; { int k = 0; for (const char *s = repoRoot; *s && k < 1023; s++) repoSlug[k++] = (*s==':'||*s=='/'||*s=='\\') ? '-' : *s; repoSlug[k] = 0; }
+  char wtpfx[1100]; snprintf(wtpfx, sizeof(wtpfx), "%s--worktrees-", repoSlug);
+
+  // 1) load existing binary cache into a path→entry map (rows point into mmap)
+  centry *cmap = NULL; char idxpath[1200]; snprintf(idxpath, sizeof(idxpath), "%s/cost-index.bin", SL_DIR);
+  size_t mlen = 0; const unsigned char *mp = map_ro(idxpath, &mlen);
+  if (mp && mlen > 8 && !memcmp(mp, "CIB2", 4)) {
+    size_t off = 4; uint32_t nf; memcpy(&nf, mp + off, 4); off += 4;
+    for (uint32_t i = 0; i < nf && off + 22 <= mlen; i++) {
+      uint16_t pl; memcpy(&pl, mp + off, 2); off += 2;
+      if (off + pl + 20 > mlen) break;
+      centry *e = calloc(1, sizeof(centry)); e->path = malloc(pl + 1); memcpy(e->path, mp + off, pl); e->path[pl] = 0; off += pl;
+      memcpy(&e->mt, mp + off, 8); off += 8; memcpy(&e->sz, mp + off, 8); off += 8;
+      memcpy(&e->nrows, mp + off, 4); off += 4;
+      e->rows = mp + off; off += (size_t)e->nrows * sizeof(crow);
+      if (off > mlen) { free(e->path); free(e); break; }
+      HASH_ADD_KEYPTR(hh, cmap, e->path, strlen(e->path), e);
+    }
+  }
+
+  // 2) enumerate relevant files (recurse projects; relevant = repo-file OR mtime<31d)
+  double cutoff31 = (double)NOW - 31.0 * 86400.0;
+  cfile *files = NULL; int nfiles = 0, fcap = 0;
+  dirit top;
+  if (di_open(&top, PROJECTS_DIR)) {
+    const char *pn; int pdir; long pmt;
+    while (di_next(&top, &pn, &pdir, &pmt)) {
+      if (!pdir) continue;
+      int isRepo = (!strcmp(pn, repoSlug) || !strncmp(pn, wtpfx, strlen(wtpfx)));
+      // recurse this project dir (BFS) collecting .jsonl
+      char projbase[1200]; snprintf(projbase, sizeof(projbase), "%s/%s", PROJECTS_DIR, pn);
+      char (*stack)[1100] = malloc(2048 * sizeof(*stack)); int sp = 0;
+      snprintf(stack[sp++], 1100, "%s", projbase);
+      while (sp > 0) {
+        char cur[1100]; snprintf(cur, sizeof(cur), "%s", stack[--sp]);
+        dirit d; if (!di_open(&d, cur)) continue;
+        const char *en; int eisdir; long emt;
+        while (di_next(&d, &en, &eisdir, &emt)) {
+          char full[1700]; snprintf(full, sizeof(full), "%s/%s", cur, en);
+          if (eisdir) { if (sp < 2048) snprintf(stack[sp++], 1100, "%s", full); continue; }
+          size_t ln = strlen(en); if (ln < 6 || strcmp(en + ln - 6, ".jsonl")) continue;
+          if (!isRepo && (double)emt < cutoff31) continue;          // not relevant
+          long esz = di_size(&d);
+          if (nfiles == fcap) { fcap = fcap ? fcap * 2 : 256; files = realloc(files, fcap * sizeof(cfile)); }
+          cfile *cf = &files[nfiles++]; snprintf(cf->path, sizeof(cf->path), "%s", full);
+          cf->mt = emt; cf->sz = esz; cf->rows = NULL; cf->nrows = 0; cf->isRepo = isRepo; cf->owned = 0;
+        }
+        di_close(&d);
+      }
+      free(stack);
+    }
+    di_close(&top);
+  }
+
+  // 3) resolve each file: cache hit (reuse mmap rows) or mark for parse
+  int *toParse = malloc((nfiles ? nfiles : 1) * sizeof(int)); int nParse = 0;
+  for (int i = 0; i < nfiles; i++) {
+    centry *e; HASH_FIND_STR(cmap, files[i].path, e);
+    if (e && e->mt == files[i].mt && e->sz == files[i].sz) { files[i].rows = (crow *)e->rows; files[i].nrows = e->nrows; files[i].owned = 0; }
+    else toParse[nParse++] = i;
+  }
+
+  // 4) parse the misses — multithreaded when many (first build), inline when few
+  int NT = 1;
+#ifdef _WIN32
+  { SYSTEM_INFO si; GetSystemInfo(&si); NT = (int)si.dwNumberOfProcessors; }
+#endif
+  if (NT > 16) NT = 16; if (NT < 1) NT = 1;
+  if (nParse >= 8 && NT > 1) {
+#ifdef _WIN32
+    HANDLE th[16]; pjob jobs[16]; int per = (nParse + NT - 1) / NT, t = 0;
+    for (int s = 0; s < nParse; s += per) { jobs[t].files = files; jobs[t].idx = toParse; jobs[t].start = s; jobs[t].end = (s + per < nParse) ? s + per : nParse;
+      th[t] = CreateThread(NULL, 0, parse_worker, &jobs[t], 0, NULL); t++; }
+    WaitForMultipleObjects(t, th, TRUE, INFINITE); for (int i = 0; i < t; i++) CloseHandle(th[i]);
+#endif
+  } else {
+    for (int i = 0; i < nParse; i++) { cfile *cf = &files[toParse[i]]; cf->rows = parse_cost_file(cf->path, &cf->nrows); cf->owned = 1; }
+  }
+  free(toParse);
+
+  // 5) aggregate: global dedup for day/week/month; separate repo dedup
+  u64set gseen, rseen; size_t est = 0; for (int i = 0; i < nfiles; i++) est += files[i].nrows;
+  u64init(&gseen, est ? est : 16); u64init(&rseen, est ? est : 16);
+  double repo = 0, day = 0, week = 0, month = 0;
+  for (int i = 0; i < nfiles; i++) {
+    cfile *cf = &files[i];
+    for (uint32_t j = 0; j < cf->nrows; j++) {
+      crow *r = &cf->rows[j];
+      double c = (r->in * P[0] + r->out * P[1] + r->cw * P[2] + r->cr * P[3]) / 1e6;
+      if (u64add(&gseen, r->idh)) {
+        if (strcmp(r->ts, monthISO) >= 0) month += c;
+        if (strcmp(r->ts, weekISO)  >= 0) week  += c;
+        if (strcmp(r->ts, todayISO) >= 0) day   += c;
+      }
+      if (cf->isRepo && u64add(&rseen, r->idh)) repo += c;
+    }
+  }
+  *o_repo = repo; *o_day = day; *o_week = week; *o_month = month;
+
+  // 6) write the new binary cache (all current relevant files) atomically.
+  //    Skip the 1.5MB write entirely when nothing was re-parsed (idle refresh) — the
+  //    existing index is already current; a stale leftover entry is just ignored.
+  if (nParse == 0) return;
+  size_t total = 8; for (int i = 0; i < nfiles; i++) total += 2 + strlen(files[i].path) + 20 + (size_t)files[i].nrows * sizeof(crow);
+  unsigned char *out = malloc(total); size_t off = 0;
+  memcpy(out + off, "CIB2", 4); off += 4; uint32_t nf = (uint32_t)nfiles; memcpy(out + off, &nf, 4); off += 4;
+  for (int i = 0; i < nfiles; i++) {
+    uint16_t pl = (uint16_t)strlen(files[i].path); memcpy(out + off, &pl, 2); off += 2;
+    memcpy(out + off, files[i].path, pl); off += pl;
+    memcpy(out + off, &files[i].mt, 8); off += 8; memcpy(out + off, &files[i].sz, 8); off += 8;
+    memcpy(out + off, &files[i].nrows, 4); off += 4;
+    if (files[i].nrows) { memcpy(out + off, files[i].rows, (size_t)files[i].nrows * sizeof(crow)); off += (size_t)files[i].nrows * sizeof(crow); }
+  }
+  write_file_atomic("cost-index.bin", out, off);
+  free(out);
+  // (memory from files/rows/cmap left for process exit — short-lived)
 }
 
 // ── formatting ──────────────────────────────────────────────────────────────────
@@ -457,22 +661,6 @@ static const char *shortModel(const char *id) {
   snprintf(o, 96, "%s", id); return o;
 }
 
-// ── globals for accumulation ────────────────────────────────────────────────────
-typedef struct { sitem *seen; double sum; } costctx;
-static void cb_repo(const urow *r, void *vp) { costctx *c = vp; if (!set_add(&c->seen, r->id)) return; c->sum += row_cost(r, P); }
-static void onfile_repo(const char *f, void *vp) { file_usage(f, cb_repo, vp); }
-
-typedef struct { sitem *seen; double day, week, month; const char *todayISO, *weekISO, *monthISO; } dwmctx;
-static void cb_dwm(const urow *r, void *vp) {
-  dwmctx *c = vp; if (!set_add(&c->seen, r->id)) return;
-  char ts[40]; snprintf(ts, sizeof(ts), "%s", r->ts);
-  char *dot = strpbrk(ts, ".Z"); if (dot) *dot = 0; // strip .\d+Z?
-  double cost = row_cost(r, P);
-  if (strcmp(ts, c->monthISO) >= 0) c->month += cost;
-  if (strcmp(ts, c->weekISO)  >= 0) c->week  += cost;
-  if (strcmp(ts, c->todayISO) >= 0) c->day   += cost;
-}
-static void onfile_dwm(const char *f, void *vp) { file_usage(f, cb_dwm, vp); }
 
 typedef struct { sitem *seen; const char *cutoff; double toks, cst; } burnctx;
 static void cb_burn(const urow *r, void *vp) {
@@ -631,26 +819,8 @@ int main(void) {
     }
   }
   if (!cost_cached) {
-    // REPO = main project + worktrees (slug prefix from DIR repoRoot)
-    char repoRoot[1024]; snprintf(repoRoot, sizeof(repoRoot), "%s", CWD);
-    char *wt = strstr(repoRoot, "/.worktrees/"); if (wt) *wt = 0;
-    char repoSlug[1024]; { int k = 0; for (const char *s = repoRoot; *s && k < 1023; s++) repoSlug[k++] = (*s==':'||*s=='/'||*s=='\\') ? '-' : *s; repoSlug[k] = 0; }
-    costctx rc = {0};
-    dirit pit;
-    if (di_open(&pit, PROJECTS_DIR)) {
-      char wtpfx[1100]; snprintf(wtpfx, sizeof(wtpfx), "%s--worktrees-", repoSlug);
-      const char *name; int isdir;
-      while (di_next(&pit, &name, &isdir, NULL)) {
-        if (strcmp(name, repoSlug) && strncmp(name, wtpfx, strlen(wtpfx))) continue;
-        char pf[1200]; snprintf(pf, sizeof(pf), "%s/%s", PROJECTS_DIR, name);
-        if (isdir) walk_jsonl(pf, 0, onfile_repo, &rc);
-      }
-      di_close(&pit);
-    }
-    cost_repo = rc.sum; set_free(&rc.seen);
-    dwmctx dc = {0}; dc.todayISO = todayISO; dc.weekISO = weekISO; dc.monthISO = monthISO;
-    walk_jsonl(PROJECTS_DIR, 31, onfile_dwm, &dc);
-    cost_day = dc.day; cost_week = dc.week; cost_month = dc.month; set_free(&dc.seen);
+    // incremental: re-parse only changed JSONL files, reuse cached rows for the rest
+    compute_costs(CWD, todayISO, weekISO, monthISO, &cost_repo, &cost_day, &cost_week, &cost_month);
     char out[512]; snprintf(out, sizeof(out),
       "{\"d\":{\"repo\":%.10g,\"month\":%.10g,\"week\":%.10g,\"day\":%.10g},\"ts\":%ld}",
       cost_repo, cost_month, cost_week, cost_day, NOW);

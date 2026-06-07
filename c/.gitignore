@@ -1,6 +1,15 @@
 statusline.exe
 *.o
 *.obj
+*.tmp.*
 mock*.json
+m*.json
 out_*.txt
 o_*.txt
+c?.txt
+b?.txt
+x.txt
+dbg.txt
+nj.txt
+par*.txt
+cost-index.bin

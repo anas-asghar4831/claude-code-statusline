@@ -17,16 +17,33 @@ warm and cold.
 - **Skill-count cache** keyed by the `plugins/cache` dir mtime — the 531-dir walk runs only
   when a plugin is added/removed.
 
-## Performance (this machine)
+## Incremental cost cache (binary, mmap, threaded, atomic)
+The cost figures (REPO/30D/7D/DAY) require summing token costs across **all** project
+history (~360MB / 1264 JSONL files), with global dedup (~52% of rows are cross-file
+duplicates from session resume/fork). A 5-min summary (`cost-cache.json`) covers warm
+renders; on expiry it rebuilds — and that rebuild is now incremental:
+
+- **`cost-index.bin`** — a binary per-file cache of parsed rows `(idHash, tokens, ISO ts)`,
+  keyed by each file's path + mtime + size. Re-parse only files that changed; reuse the rest.
+- **mmap read** (`MapViewOfFile`) — load the index with no copy/JSON-parse.
+- **Multithreaded first build** — parse the misses across all cores (only the cold first run,
+  or when many files changed).
+- **Atomic writes** (temp + rename) — safe across concurrent Claude Code sessions.
+- Rows store raw tokens (pricing applied at aggregation → correct under model switches) and
+  the ISO timestamp (so the rolling windows recompute exactly). Dedup by 64-bit id hash.
+
+## Performance (this machine, 360MB / 1264 JSONL)
 | | C | Node | speedup |
 |---|---|---|---|
-| internal compute | **~3.7 ms** | — | — |
+| internal compute (warm) | **~3.7 ms** | — | — |
 | warm end-to-end (real exe) | ~12 ms | ~264 ms | ~22x |
-| cold (full 360MB cost re-parse) | ~1.56 s | ~3.1 s | 2.0x |
+| **cold cost rebuild (incremental)** | **~40 ms** | ~3.1 s | **~75x** |
+| cold first-ever build (threaded) | ~0.5 s | ~3.1 s | ~6x |
 
-Internal compute is ~3.7 ms; the rest of the ~12 ms is Windows process creation + exe load
-(OS cost, not code — only a persistent daemon could avoid it, but the statusline is spawned
-fresh each render). Profile with `STATUSLINE_PROF=1` (phase timings to stderr).
+Before the incremental cache, a cold rebuild re-parsed all 360MB (~1.3 s). Now it re-parses
+only the active file. Warm compute is ~3.7 ms; the rest of the ~12 ms is Windows process
+creation + exe load (OS cost — only a persistent daemon avoids it, but the statusline is
+spawned fresh each render). Profile with `STATUSLINE_PROF=1` (phase timings to stderr).
 
 ## Dirty-flag caveat
 The fast path detects modified/deleted tracked files instantly. Staged and untracked states
