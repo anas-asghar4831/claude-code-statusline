@@ -3,5 +3,5 @@
 # yyjson.c/.h and uthash.h are vendored alongside this script.
 set -e
 cd "$(dirname "$0")"
-gcc -O3 -march=native -flto -o statusline.exe statusline.c yyjson.c
+gcc -O3 -march=native -flto -s -o statusline.exe statusline.c yyjson.c
 echo "built: $(pwd)/statusline.exe"

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -184,6 +185,91 @@ static int find_git_root(const char *start, char *out) {
   }
   return 0;
 }
+// ── git internals (read .git directly — zero subprocess) ─────────────────────
+static uint32_t be32(const unsigned char *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+// resolve the real git dir for a repo root (handles .git file → "gitdir: <path>")
+static void resolve_gitdir(const char *root, char *out, size_t outn) {
+  char dg[1200]; snprintf(dg, sizeof(dg), "%s/.git", root);
+  if (is_dir(dg)) { snprintf(out, outn, "%s", dg); return; }
+  char *c = read_file(dg, NULL);
+  if (c && !strncmp(c, "gitdir:", 7)) { char *p = c + 7; while (*p == ' ') p++; char *nl = strpbrk(p, "\r\n"); if (nl) *nl = 0;
+    if (p[0] && (p[1] == ':' || p[0] == '/')) snprintf(out, outn, "%s", p);      // absolute
+    else snprintf(out, outn, "%s/%s", root, p);                                   // relative
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/'; free(c); return; }
+  free(c); snprintf(out, outn, "%s", dg);
+}
+// read a ref name → 40-char sha (loose ref file, else packed-refs). 1 ok.
+static int resolve_ref(const char *gitdir, const char *refname, char out[64]) {
+  char p[1300]; snprintf(p, sizeof(p), "%s/%s", gitdir, refname);
+  char *c = read_file(p, NULL);
+  if (c) { int ok = 0; if (strlen(c) >= 40) { memcpy(out, c, 40); out[40] = 0; ok = 1; } free(c); if (ok) return 1; }
+  char pp[1300]; snprintf(pp, sizeof(pp), "%s/packed-refs", gitdir);
+  char *pr = read_file(pp, NULL); if (!pr) return 0;
+  int found = 0; char *save = NULL;
+  for (char *line = strtok_r(pr, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    if (line[0] == '#' || line[0] == '^') continue;
+    char *sp = strchr(line, ' '); if (!sp) continue;
+    if (!strcmp(sp + 1, refname)) { *sp = 0; if (strlen(line) >= 40) { memcpy(out, line, 40); out[40] = 0; found = 1; } break; }
+  }
+  free(pr); return found;
+}
+// parse .git/config for [branch "<b>"] remote/merge → upstream ref name. 1 if found.
+static int branch_upstream_ref(const char *gitdir, const char *branch, char out[300]) {
+  char p[1300]; snprintf(p, sizeof(p), "%s/config", gitdir);
+  char *c = read_file(p, NULL); if (!c) return 0;
+  char want[300]; snprintf(want, sizeof(want), "[branch \"%s\"]", branch);
+  char remote[128] = "", merge[256] = ""; int in = 0, found = 0; char *save = NULL;
+  for (char *line = strtok_r(c, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    char *s = line; while (*s == ' ' || *s == '\t') s++;
+    if (*s == '[') { in = !strncmp(s, want, strlen(want)); continue; }
+    if (!in) continue;
+    char *eq = strchr(s, '='); if (!eq) continue; char *v = eq + 1; while (*v == ' ' || *v == '\t') v++;
+    char *end = v + strlen(v); while (end > v && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) *--end = 0;
+    if (!strncmp(s, "remote", 6)) snprintf(remote, sizeof(remote), "%s", v);
+    else if (!strncmp(s, "merge", 5)) snprintf(merge, sizeof(merge), "%s", v);
+  }
+  free(c);
+  if (*remote && !strncmp(merge, "refs/heads/", 11)) { snprintf(out, 300, "refs/remotes/%s/%s", remote, merge + 11); found = 1; }
+  return found;
+}
+// dirty check by parsing .git/index (v2/v3) + stat per entry. early-exit.
+// returns 1 dirty, 0 clean, -1 unknown (caller should fall back to `git status`).
+static int index_dirty(const char *root, const char *gitdir) {
+  char ip[1200]; snprintf(ip, sizeof(ip), "%s/index", gitdir);
+  long n = 0; char *raw = read_file(ip, &n);
+  if (!raw || n < 12) { free(raw); return -1; }
+  unsigned char *b = (unsigned char *)raw;
+  if (memcmp(b, "DIRC", 4)) { free(raw); return -1; }
+  uint32_t ver = be32(b + 4), cnt = be32(b + 8);
+  if (ver < 2 || ver > 3) { free(raw); return -1; }   // v4 path-compression → fall back
+  size_t off = 12; int dirty = 0;
+  char full[4300];
+  for (uint32_t i = 0; i < cnt; i++) {
+    if (off + 62 > (size_t)n) { dirty = -1; break; }
+    unsigned char *e = b + off;
+    uint32_t mtime_s = be32(e + 8), fsize = be32(e + 36);
+    uint16_t flags = ((uint16_t)e[60] << 8) | e[61];
+    int assume_valid = flags & 0x8000, extended = flags & 0x4000, namelen = flags & 0x0FFF;
+    size_t hdr = 62; if (ver >= 3 && extended) hdr += 2;
+    const char *namep = (const char *)(b + off + hdr);
+    int L = namelen;
+    if (namelen == 0x0FFF) { L = (int)strnlen(namep, (size_t)(n - (off + hdr))); }
+    if (off + hdr + L + 1 > (size_t)n) { dirty = -1; break; }
+    if (!assume_valid) {
+      if (L < (int)sizeof(full) - (int)strlen(root) - 2) {
+        snprintf(full, sizeof(full), "%s/%.*s", root, L, namep);
+        struct stat st;
+        if (stat(full, &st) != 0) { dirty = 1; break; }
+        if ((uint32_t)st.st_size != fsize || (uint32_t)st.st_mtime != mtime_s) { dirty = 1; break; }
+      }
+    }
+    size_t elen = hdr + L + 1; elen = (elen + 7) & ~(size_t)7;   // 8-byte padded (v2/3)
+    off += elen;
+  }
+  free(raw);
+  return dirty;
+}
+
 // ── fast directory iterator — Win32 FindFirstFile yields name+isdir+mtime inline
 //    (no per-entry stat/GetFileAttributes), POSIX falls back to readdir+stat. ──
 typedef struct {
@@ -612,46 +698,81 @@ int main(void) {
   long baseOverhead = sx.haveFirst ? sx.firstBase : 0;
   PROF("session");
 
-  // ── git ──
-  // PERF: (1) find .git root ourselves (no rev-parse spawn, no spawn at all when not a
-  //   repo). (2) spawn status-v2 + rev-list + submodule CONCURRENTLY then collect, so
-  //   wall time ≈ one git spawn instead of 4 sequential. (3) --no-optional-locks skips
-  //   the index-refresh write. status --porcelain=v2 --branch carries branch+ab+dirty.
+  // ── git (ZERO subprocess on the common path) ──
+  // branch ← .git/HEAD; dirty ← parse .git/index + stat (gitstatusd technique);
+  // commit-count + ahead/behind ← cached by HEAD/upstream sha (git-cache.json), so a
+  // subprocess runs ONLY right after HEAD or upstream moves (commit/fetch/checkout).
   char gitBranch[256] = "", gitCommits[64] = "0"; const char *gitIcon = "✅";
-  long gitAhead = 0, gitBehind = 0, gitSubmodules = 0; int gitSubDirty = 0;
+  long gitAhead = 0, gitBehind = 0, gitSubmodules = 0; int gitSubDirty = 0; int gitHaveAB = 0;
   {
     char gitroot[1024];
     if (find_git_root(CWD, gitroot)) {
-      // pre-read .gitmodules (cheap file read) to decide if submodule spawn is needed
-      char gm[1200]; snprintf(gm, sizeof(gm), "%s/.gitmodules", gitroot);
-      char *gmc = read_file(gm, NULL);
-      if (gmc) { char *p = gmc; if (!strncmp(p, "[submodule ", 11)) gitSubmodules++;
-        while ((p = strstr(p, "\n[submodule "))) { gitSubmodules++; p += 1; } free(gmc); }
-      char ca[1400], cb[1400], cc2[1400];
-      snprintf(ca, sizeof(ca), "git --no-optional-locks -C \"%s\" status --porcelain=v2 --branch %s", CWD, NULDEV);
-      snprintf(cb, sizeof(cb), "git -C \"%s\" rev-list --count HEAD %s", CWD, NULDEV);
-      acmd A, B, C; ac_spawn(&A, ca); ac_spawn(&B, cb);
-      if (gitSubmodules > 0) { snprintf(cc2, sizeof(cc2), "git -C \"%s\" submodule status %s", CWD, NULDEV); ac_spawn(&C, cc2); }
-      char *stv = ac_collect(&A), *cnt = ac_collect(&B), *ss = gitSubmodules > 0 ? ac_collect(&C) : NULL;
-      int dirty = 0;
-      if (stv && *stv) {
-        char *save = NULL;
-        for (char *line = strtok_r(stv, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-          if (line[0] == '#') {
-            if (!strncmp(line, "# branch.head ", 14)) { const char *h = line + 14; if (strcmp(h, "(detached)")) snprintf(gitBranch, sizeof(gitBranch), "%s", h); }
-            else if (!strncmp(line, "# branch.ab ", 12)) { long a = 0, b = 0; sscanf(line + 12, "+%ld -%ld", &a, &b); gitAhead = a; gitBehind = b; }
-          } else if (line[0]) { dirty = 1; }
-        }
+      char gitdir[1200]; resolve_gitdir(gitroot, gitdir, sizeof(gitdir));
+      // HEAD → branch + sha (no spawn)
+      char headsha[64] = ""; char hp[1300]; snprintf(hp, sizeof(hp), "%s/HEAD", gitdir);
+      char *head = read_file(hp, NULL);
+      if (head) {
+        if (!strncmp(head, "ref:", 4)) { char *r = head + 4; while (*r == ' ') r++; char *nl = strpbrk(r, "\r\n"); if (nl) *nl = 0;
+          snprintf(gitBranch, sizeof(gitBranch), "%s", !strncmp(r, "refs/heads/", 11) ? r + 11 : r);
+          resolve_ref(gitdir, r, headsha);
+        } else { char *nl = strpbrk(head, "\r\n"); if (nl) *nl = 0; if (strlen(head) >= 40) { memcpy(headsha, head, 40); headsha[40] = 0; } }
+        free(head);
       }
-      // match JS: only surface commits/dirty/ab/submodule when a branch is shown (non-detached)
       if (*gitBranch) {
+        // dirty: (a) in-process index scan catches unstaged edits/deletes INSTANTLY (0 spawn).
+        //   (b) staged + untracked need authoritative `git status`, but its result is cached
+        //   keyed by .git/index mtime — re-runs only when the index changes (add/commit/
+        //   checkout), so steady-state renders stay spawn-free. Also the fallback for a v4
+        //   index that (a) can't parse. Caveat: an untracked file created with no other index
+        //   change won't flip the icon until the next index write or any unstaged edit.
+        int dirty = 0, d = index_dirty(gitroot, gitdir);
+        if (d == 1) dirty = 1;
+        else {
+          char ixp[1300]; snprintf(ixp, sizeof(ixp), "%s/index", gitdir); long idxmt = mtime_of(ixp);
+          int cached = -1;
+          yyjson_doc *sc = read_cache_copy("status-cache.json");
+          if (sc) { yyjson_val *r = yyjson_doc_get_root(sc); const char *sr = yyjson_get_str(yyjson_obj_get(r, "root"));
+            long im = (long)yyjson_get_num(yyjson_obj_get(r, "im"));
+            if (sr && !strcmp(sr, gitroot) && im == idxmt) cached = (int)yyjson_get_num(yyjson_obj_get(r, "dirty"));
+            yyjson_doc_free(sc); }
+          if (cached < 0) { char cmd[1400]; snprintf(cmd, sizeof(cmd), "git --no-optional-locks -C \"%s\" status --porcelain %s", CWD, NULDEV);
+            char *st = run_cmd(cmd); cached = (st && *st) ? 1 : 0; free(st);
+            char out[1200]; snprintf(out, sizeof(out), "{\"root\":\"%s\",\"im\":%ld,\"dirty\":%d}", gitroot, idxmt, cached); write_cache_raw("status-cache.json", out); }
+          dirty = cached;
+        }
         if (dirty) gitIcon = "⚠️";
-        if (cnt && *cnt) snprintf(gitCommits, sizeof(gitCommits), "%s", cnt);
-        if (ss) { for (char *q = ss; *q; ) { if (*q=='+'||*q=='-'||*q=='U') { gitSubDirty = 1; break; } char *nl = strchr(q, '\n'); if (!nl) break; q = nl + 1; } }
-      } else { gitAhead = 0; gitBehind = 0; }
-      free(stv); free(cnt); free(ss);
+        // upstream sha (no spawn)
+        char upref[300] = "", upsha[64] = ""; int haveUp = branch_upstream_ref(gitdir, gitBranch, upref) && resolve_ref(gitdir, upref, upsha);
+        // commit count + ahead/behind cached by sha
+        long count = -1; int abA = 0, abB = 0, abOK = 0;
+        yyjson_doc *gc = read_cache_copy("git-cache.json");
+        if (gc) { yyjson_val *r = yyjson_doc_get_root(gc);
+          const char *ch = yyjson_get_str(yyjson_obj_get(r, "head"));
+          if (ch && headsha[0] && !strcmp(ch, headsha)) {
+            count = (long)yyjson_get_num(yyjson_obj_get(r, "count"));
+            const char *cu = yyjson_get_str(yyjson_obj_get(r, "up"));
+            if (haveUp && cu && !strcmp(cu, upsha)) { abA = (int)yyjson_get_num(yyjson_obj_get(r, "a")); abB = (int)yyjson_get_num(yyjson_obj_get(r, "b")); abOK = 1; }
+          }
+          yyjson_doc_free(gc);
+        }
+        if (count < 0) { char cmd[1400]; snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-list --count HEAD %s", CWD, NULDEV);
+          char *c = run_cmd(cmd); count = (c && *c) ? atol(c) : 0; free(c); }
+        if (haveUp && !abOK) { char cmd[1400]; snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-list --count --left-right HEAD...@{u} %s", CWD, NULDEV);
+          char *c = run_cmd(cmd); if (c && *c) { long a = 0, bb = 0; sscanf(c, "%ld\t%ld", &a, &bb); abA = (int)a; abB = (int)bb; } free(c); abOK = 1; }
+        snprintf(gitCommits, sizeof(gitCommits), "%ld", count);
+        gitAhead = abA; gitBehind = abB; gitHaveAB = abOK;
+        { char out[256]; snprintf(out, sizeof(out), "{\"head\":\"%s\",\"count\":%ld,\"up\":\"%s\",\"a\":%d,\"b\":%d}", headsha, count, haveUp ? upsha : "", abA, abB); write_cache_raw("git-cache.json", out); }
+        // submodules (rare; only when .gitmodules present)
+        char gm[1200]; snprintf(gm, sizeof(gm), "%s/.gitmodules", gitroot);
+        char *gmc = read_file(gm, NULL);
+        if (gmc) { char *p = gmc; if (!strncmp(p, "[submodule ", 11)) gitSubmodules++;
+          while ((p = strstr(p, "\n[submodule "))) { gitSubmodules++; p += 1; } free(gmc); }
+        if (gitSubmodules > 0) { char cmd[1400]; snprintf(cmd, sizeof(cmd), "git -C \"%s\" submodule status %s", CWD, NULDEV);
+          char *ss = run_cmd(cmd); if (ss) { for (char *q = ss; *q; ) { if (*q=='+'||*q=='-'||*q=='U') { gitSubDirty = 1; break; } char *nl = strchr(q, '\n'); if (!nl) break; q = nl + 1; } free(ss); } }
+      }
     }
   }
+  (void)gitHaveAB;
 
   PROF("git");
   // ── launch dir ──
