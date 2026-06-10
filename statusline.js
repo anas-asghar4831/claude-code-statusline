@@ -430,18 +430,39 @@ if (DIR === LAUNCH_DIR || !DIR.startsWith(LAUNCH_DIR + '/')) {
   dirDisplay = `${C.white}${C.bold}${LAUNCH_DIR}${R} ${C.gray}→${R} ${C.yellow}${DIR.slice(LAUNCH_DIR.length + 1)}${R}`;
 }
 
+// ── Terminal-width wrapping ───────────────────────────────────────────────────
+const termW = process.stdout.columns || 120;
+const visLen = (s) => s.replace(/\x1b\[[^m]*m/g, '').replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '  ').replace(/[^\x00-\x7F]/g, '  ').length;
+function putsWrapped(line) {
+  if (visLen(line) <= termW) { console.log(line); return; }
+  const chunks = line.split(SEP);
+  let cur = '', curW = 0;
+  for (const chunk of chunks) {
+    const cw = visLen(chunk) + (cur ? visLen(SEP) : 0);
+    if (cur && curW + cw > termW) { console.log(cur); cur = chunk; curW = visLen(chunk); }
+    else { cur += (cur ? SEP : '') + chunk; curW += cw; }
+  }
+  if (cur) console.log(cur);
+}
+
 // ── LINE 1: path | model | flags | ctx ───────────────────────────────────────
 const branchStr = gitBranch ? ` ${C.teal}(${gitBranch})${R}` : '';
-let L1 = '';
-if (SESSION_NAME) L1 += `${C.pink}${C.bold}${SESSION_NAME}${R}  `;
-L1 += `${dirDisplay}${branchStr} ${gitIcon}`;
+let L1 = `${dirDisplay}${branchStr} ${gitIcon}`;
 L1 += ` ${SEP} 🧠 ${C.magenta}${MODEL}${R}`;
 if (FAST_MODE)  L1 += ` ${SEP} ${C.yellow}⚡fast${R}`;
 if (EXCEEDS_200K) L1 += ` ${SEP} ${C.red}${C.bold}⚠ >200K${R}`;
 const ctxSizeStr = CTX_SIZE >= 1e6 ? (CTX_SIZE / 1e6).toFixed(0) + 'M' : (CTX_SIZE / 1000).toFixed(0) + 'k';
 const ctxUsedStr = CTX_TOTAL_IN > 0 ? fmtTok(CTX_TOTAL_IN + CTX_TOTAL_OUT) + '/' + ctxSizeStr : fmtTok(CTX_TOKENS);
 L1 += ` ${SEP} ${ctxC}${ctxBar} ${PCT}%${R} ${C.gray}(${ctxUsedStr})${R}`;
-console.log(L1);
+putsWrapped(L1);
+
+// ── LINE 1-title: session name + session id ───────────────────────────────────
+if (SESSION_NAME || SESSION_ID) {
+  let Ltitle = '';
+  if (SESSION_NAME) Ltitle += `${C.pink}${C.bold}${SESSION_NAME}${R}`;
+  if (SESSION_ID)   Ltitle += `${SESSION_NAME ? `  ${SEP}  ` : ''}${C.gray}id:${SESSION_ID}${R}`;
+  console.log(Ltitle);
+}
 
 // ── LINE 1b: session tokens ───────────────────────────────────────────────────
 const sTotal = sIn + sOut + sCw + sCr;
