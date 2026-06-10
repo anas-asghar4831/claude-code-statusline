@@ -77,14 +77,23 @@ static void set_free(sitem **set) {
 
 // ── terminal width + ANSI-aware wrapping ──────────────────────────────────────
 static int get_term_width(void) {
+  const char *env = getenv("COLUMNS"); if (env && atoi(env) > 0) return atoi(env);
 #ifdef _WIN32
   CONSOLE_SCREEN_BUFFER_INFO csbi;
+  // try stdout first; if piped, open CONOUT$ to get real terminal width
   if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
     return csbi.srWindow.Right - csbi.srWindow.Left + 1;
+  HANDLE con = CreateFileA("CONOUT$", GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (con != INVALID_HANDLE_VALUE) {
+    int w = 0;
+    if (GetConsoleScreenBufferInfo(con, &csbi)) w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+    CloseHandle(con);
+    if (w > 0) return w;
+  }
 #else
-  #include <sys/ioctl.h>
   struct winsize ws;
   if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+  if (ioctl(2, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
 #endif
   return 120;
 }

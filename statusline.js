@@ -431,7 +431,7 @@ if (DIR === LAUNCH_DIR || !DIR.startsWith(LAUNCH_DIR + '/')) {
 }
 
 // ── Terminal-width wrapping ───────────────────────────────────────────────────
-const termW = process.stdout.columns || 120;
+const termW = process.stdout.columns || process.stderr.columns || parseInt(process.env.COLUMNS || '0') || 120;
 const visLen = (s) => s.replace(/\x1b\[[^m]*m/g, '').replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '  ').replace(/[^\x00-\x7F]/g, '  ').length;
 function putsWrapped(line) {
   if (visLen(line) <= termW) { console.log(line); return; }
