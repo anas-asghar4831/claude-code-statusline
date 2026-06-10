@@ -1250,9 +1250,8 @@ int main(void) {
       char Ltitle[768] = "";
       if (*SESSION_NAME) { char t[512]; snprintf(t, sizeof(t), C_pink C_bold "%s" R, SESSION_NAME); strcat(Ltitle, t); }
       if (*SESSION_ID) {
-        char sid[16]; snprintf(sid, sizeof(sid), "%.8s", SESSION_ID);
         int has_name = *SESSION_NAME != 0;
-        char t[128]; snprintf(t, sizeof(t), "%s" C_gray "id:" R C_gray "%s\xe2\x80\xa6" R, has_name ? "  " SEP "  " : "", sid);
+        char t[256]; snprintf(t, sizeof(t), "%s" C_gray "id:" R C_gray "%s" R, has_name ? "  " SEP "  " : "", SESSION_ID);
         strcat(Ltitle, t);
       }
       puts(Ltitle);
