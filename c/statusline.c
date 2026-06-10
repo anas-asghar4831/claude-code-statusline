@@ -75,6 +75,50 @@ static void set_free(sitem **set) {
   sitem *it, *tmp; HASH_ITER(hh, *set, it, tmp) { HASH_DEL(*set, it); free(it->key); free(it); }
 }
 
+// ── terminal width + ANSI-aware wrapping ──────────────────────────────────────
+static int get_term_width(void) {
+#ifdef _WIN32
+  CONSOLE_SCREEN_BUFFER_INFO csbi;
+  if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
+    return csbi.srWindow.Right - csbi.srWindow.Left + 1;
+#else
+  #include <sys/ioctl.h>
+  struct winsize ws;
+  if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+#endif
+  return 120;
+}
+// visual column count for first n bytes (n=0 → full string); strips ANSI, emoji=2-wide
+static int vis_len_n(const char *s, size_t n) {
+  int w = 0; const char *end = n ? s + n : s + strlen(s);
+  while (s < end && *s) {
+    unsigned char c = (unsigned char)*s;
+    if (c == 0x1b && s+1 < end && *(s+1) == '[') { s += 2; while (s < end && *s && *s != 'm') s++; if (s < end && *s) s++; }
+    else if (c >= 0xF0) { w += 2; s += 4; }
+    else if (c >= 0xE0) { w += 2; s += 3; }
+    else if (c >= 0x80) { s++; }
+    else { w++; s++; }
+  }
+  return w;
+}
+static int vis_len(const char *s) { return vis_len_n(s, 0); }
+// puts() with SEP-boundary wrapping when line exceeds term_w
+static void puts_wrapped(const char *line, int term_w) {
+  static const char SEP_RAW[] = "\x1b[38;2;166;173;200m | \x1b[0m";
+  static const size_t SEP_LEN = sizeof(SEP_RAW) - 1;
+  if (term_w <= 40 || vis_len(line) <= term_w) { puts(line); return; }
+  const char *p = line; int cur_w = 0;
+  while (*p) {
+    const char *sep = strstr(p, SEP_RAW);
+    const char *chunk_end = sep ? sep + SEP_LEN : p + strlen(p);
+    int chunk_w = vis_len_n(p, (size_t)(chunk_end - p));
+    if (cur_w > 0 && cur_w + chunk_w > term_w) { printf("\n  "); cur_w = 2; }
+    fwrite(p, 1, chunk_end - p, stdout); cur_w += chunk_w;
+    p = chunk_end;
+  }
+  putchar('\n');
+}
+
 // ── file + cmd helpers ─────────────────────────────────────────────────────────
 static char *read_file(const char *path, long *outlen) {
   FILE *f = fopen(path, "rb"); if (!f) return NULL;
@@ -1189,8 +1233,8 @@ int main(void) {
   else snprintf(dirDisplay, sizeof(dirDisplay), C_white C_bold "%s" R " " C_gray "→" R " " C_yellow "%s" R, LAUNCH_DIR, CWD + ldl + 1);
 
   // ── LINE 1 ──
-  { char L1[4096] = "";
-    if (*SESSION_NAME) { char t[512]; snprintf(t, sizeof(t), C_pink C_bold "%s" R "  ", SESSION_NAME); strcat(L1, t); }
+  { int tw = get_term_width();
+    char L1[4096] = "";
     strcat(L1, dirDisplay);
     if (*gitBranch) { char t[320]; snprintf(t, sizeof(t), " " C_teal "(%s)" R, gitBranch); strcat(L1, t); }
     { char t[64]; snprintf(t, sizeof(t), " %s", gitIcon); strcat(L1, t); }
@@ -1200,7 +1244,20 @@ int main(void) {
     char ctxSizeStr[32]; if (CTX_SIZE >= 1000000) snprintf(ctxSizeStr, sizeof(ctxSizeStr), "%.0fM", CTX_SIZE/1e6); else snprintf(ctxSizeStr, sizeof(ctxSizeStr), "%.0fk", CTX_SIZE/1000.0);
     char ctxUsedStr[64]; if (CTX_TOTAL_IN > 0) snprintf(ctxUsedStr, sizeof(ctxUsedStr), "%s/%s", fmtTok(CTX_TOTAL_IN + CTX_TOTAL_OUT), ctxSizeStr); else snprintf(ctxUsedStr, sizeof(ctxUsedStr), "%s", fmtTok(CTX_TOKENS));
     { char t[256]; snprintf(t, sizeof(t), " " SEP " %s%s %d%%" R " " C_gray "(%s)" R, ctxC, ctxBar, PCT, ctxUsedStr); strcat(L1, t); }
-    puts(L1); }
+    puts_wrapped(L1, tw);
+    // ── LINE 1-title: session name + id (only when present) ──
+    if (*SESSION_NAME || *SESSION_ID) {
+      char Ltitle[768] = "";
+      if (*SESSION_NAME) { char t[512]; snprintf(t, sizeof(t), C_pink C_bold "%s" R, SESSION_NAME); strcat(Ltitle, t); }
+      if (*SESSION_ID) {
+        char sid[16]; snprintf(sid, sizeof(sid), "%.8s", SESSION_ID);
+        int has_name = *SESSION_NAME != 0;
+        char t[128]; snprintf(t, sizeof(t), "%s" C_gray "id:" R C_gray "%s\xe2\x80\xa6" R, has_name ? "  " SEP "  " : "", sid);
+        strcat(Ltitle, t);
+      }
+      puts(Ltitle);
+    }
+  }
 
   // ── LINE 1b ──
   { long sTotal = sIn + sOut + sCw + sCr; char L1b[1024];
