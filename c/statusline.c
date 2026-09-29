@@ -797,6 +797,10 @@ int main(void) {
   char MODEL_ID[256]; snprintf(MODEL_ID, sizeof(MODEL_ID), "%s", gstr("/model/id", ""));
   const char *SESSION_ID = gstr("/session_id", "");
   const char *SESSION_NAME = gstr("/session_name", "");
+  // compact mode: per-session flag file SL_DIR/compact/<session_id> (toggle live via the /sl skill)
+  int COMPACT = 0;
+  if (*SESSION_ID && !strpbrk(SESSION_ID, "/\\")) { char cp[1300]; snprintf(cp, sizeof(cp), "%s/compact/%s", SL_DIR, SESSION_ID);
+    FILE *cf = fopen(cp, "rb"); if (cf) { COMPACT = 1; fclose(cf); } }
   const char *VERSION = gstr("/version", "");
 
   char CWD[1024]; snprintf(CWD, sizeof(CWD), "%s", gstr("/workspace/current_dir", ".")); slashfix(CWD);
@@ -828,8 +832,9 @@ int main(void) {
 
   yyjson_val *vR5 = gp("/rate_limits/five_hour/resets_at");
   yyjson_val *vR7 = gp("/rate_limits/seven_day/resets_at");
-  long RATE_5H_RESET = (vR5 && yyjson_is_num(vR5)) ? (long)yyjson_get_num(vR5) : 0;
-  long RATE_7D_RESET = (vR7 && yyjson_is_num(vR7)) ? (long)yyjson_get_num(vR7) : 0;
+  // ponytail: long is 32-bit on Windows; out-of-range resets_at (>2038) treated as absent, else localtime() -> NULL -> segfault
+  long RATE_5H_RESET = (vR5 && yyjson_is_num(vR5) && yyjson_get_num(vR5) > 0 && yyjson_get_num(vR5) < 2147483647.0) ? (long)yyjson_get_num(vR5) : 0;
+  long RATE_7D_RESET = (vR7 && yyjson_is_num(vR7) && yyjson_get_num(vR7) > 0 && yyjson_get_num(vR7) < 2147483647.0) ? (long)yyjson_get_num(vR7) : 0;
   double RATE_5H = gnum("/rate_limits/five_hour/used_percentage", 0);
   double RATE_7D = gnum("/rate_limits/seven_day/used_percentage", 0);
 
@@ -1177,7 +1182,7 @@ int main(void) {
   int subCount = 0;
   typedef struct { char type[96]; int count; double cost; } sub_t;
   sub_t subs[32]; int nsubs = 0;
-  if (*SESSION_ID) {
+  if (*SESSION_ID && !COMPACT) {
     char slug[1024]; { int k = 0; for (const char *s = CWD; *s && k < 1023; s++) slug[k++] = (*s==':'||*s=='/'||*s=='\\') ? '-' : *s; slug[k] = 0; }
     char projDir[1200]; snprintf(projDir, sizeof(projDir), "%s/%s", PROJECTS_DIR, slug);
     // collect agent-*.jsonl within 7 days
@@ -1256,19 +1261,23 @@ int main(void) {
     puts_wrapped(L1, tw);
     // ── LINE 1-title: session name + id (only when present) ──
     if (*SESSION_NAME || *SESSION_ID) {
-      char Ltitle[768] = "";
+      char Ltitle[1024] = "";
       if (*SESSION_NAME) { char t[512]; snprintf(t, sizeof(t), C_pink C_bold "%s" R, SESSION_NAME); strcat(Ltitle, t); }
       if (*SESSION_ID) {
         int has_name = *SESSION_NAME != 0;
         char t[256]; snprintf(t, sizeof(t), "%s" C_gray "id:" R C_gray "%s" R, has_name ? "  " SEP "  " : "", SESSION_ID);
         strcat(Ltitle, t);
       }
+      if (COMPACT) { // effort + thinking ride on the title line (LINE 1b is hidden)
+        if (*EFFORT) { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_gray "effort:" R C_orange "%s" R, EFFORT); strcat(Ltitle, t); }
+        if (THINKING) strcat(Ltitle, " " SEP " " C_cyan "\U0001f4ad thinking" R);
+      }
       puts(Ltitle);
     }
   }
 
   // ── LINE 1b ──
-  { long sTotal = sIn + sOut + sCw + sCr; char L1b[1024];
+  if (!COMPACT) { long sTotal = sIn + sOut + sCw + sCr; char L1b[1024];
     snprintf(L1b, sizeof(L1b),
       C_gray "In:" R C_blue "%s" R " " SEP " " C_gray "Out:" R C_magenta "%s" R " " SEP " " C_gray "Write:" R C_orange "%s" R " " SEP " " C_gray "Read:" R C_teal "%s" R " " SEP " " C_gray "Total:" R C_white "%s" R,
       fmtTok(sIn), fmtTok(sOut), fmtTok(sCw), fmtTok(sCr), fmtTok(sTotal));
@@ -1277,7 +1286,7 @@ int main(void) {
     puts(L1b); }
 
   // ── LINE 1c ──
-  { long cbTotal = cbIn + cbCw + cbCr;
+  if (!COMPACT) { long cbTotal = cbIn + cbCw + cbCr;
     if (cbTotal > 0) { char L1c[1024];
       snprintf(L1c, sizeof(L1c),
         C_gray "\U0001f9ee ctx:" R " " C_gray "Reused" R " " C_teal "%s" R " " SEP " " C_gray "+Cache" R " " C_orange "%s" R " " SEP " " C_gray "Fresh" R " " C_blue "%s" R " " SEP " " C_gray "Out" R " " C_magenta "%s" R,
@@ -1301,13 +1310,18 @@ int main(void) {
       } else { char a[64]; snprintf(a, sizeof(a), " • 7DAY %d%%", (int)(RATE_7D + 0.5)); strcat(s, a); }
       snprintf(L2, sizeof(L2), C_yellow "%s" R, s);
     } else snprintf(L2, sizeof(L2), C_gray "No rate limit data" R);
+    if (COMPACT) { puts(L2); goto after_l2; }
     { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_green "+%ld" R "/" C_red "-%ld" R, LINES_ADD, LINES_DEL); strcat(L2, t); }
     if (gitAhead || gitBehind) { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_teal "↑%ld" R C_gray "/" R C_orange "↓%ld" R, gitAhead, gitBehind); strcat(L2, t); }
     { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_gray "Commits:" R C_gold "%s" R, gitCommits); strcat(L2, t); }
     if (DURATION_MS) { int apiPct = DURATION_MS > 0 ? (int)(API_DUR_MS * 100 / DURATION_MS + 0.5) : 0;
       char t[256]; snprintf(t, sizeof(t), " " SEP " " C_gray "⏱ " R C_cyan "%s" R " " C_gray "(%d%% API)" R, fmtDur(DURATION_MS), apiPct); strcat(L2, t); }
     { char t[64]; snprintf(t, sizeof(t), " " SEP " " C_bold "\U0001f550 %s" R, clock_now()); strcat(L2, t); }
-    puts(L2); }
+    puts(L2);
+    after_l2:; }
+
+  // everything below is hidden in compact mode
+  if (COMPACT) { PROF("output"); return 0; }
 
   // ── LINE 3 ──
   { long denom = sIn + sCw + sCr; int cacheHit = denom > 0 ? (int)(sCr * 100.0 / denom + 0.5) : 0;
@@ -1385,16 +1399,6 @@ int main(void) {
     if (mcp.n) { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_gray "MCP:" R C_magenta "%d" R, mcp.n); strcat(L7, t); }
     if (*VERSION) { char t[128]; snprintf(t, sizeof(t), " " SEP " " C_gray "v%s" R, VERSION); strcat(L7, t); }
     puts(L7); }
-
-  // ── plugin names (5/line) ──
-  for (int i = 0; i < plugins.n; i += 5) { char line[2048] = "   ";
-    for (int j = i; j < i + 5 && j < plugins.n; j++) { if (j > i) strcat(line, C_gray ", " R); char t[256]; snprintf(t, sizeof(t), C_teal "%s" R, plugins.v[j]); strcat(line, t); }
-    puts(line); }
-
-  // ── MCP names ──
-  if (mcp.n) for (int i = 0; i < mcp.n; i += 5) { char line[2048]; snprintf(line, sizeof(line), "\U0001f50c %s", i == 0 ? "" : "   ");
-    for (int j = i; j < i + 5 && j < mcp.n; j++) { if (j > i) strcat(line, C_gray ", " R); char t[256]; snprintf(t, sizeof(t), C_magenta "%s" R, mcp.v[j]); strcat(line, t); }
-    puts(line); }
 
   PROF("output");
   return 0;
