@@ -142,6 +142,22 @@ To use a fixed location instead of IP geolocation, edit `location-cache.json`:
 
 ---
 
+## Compact mode (C build only)
+
+Hides everything except dir/git, model, context bar, session title + id, effort/thinking and rate limits — **per session**, toggled live.
+
+Install the toggle skill once (copy, then it's available as `/sl` in every session):
+
+```bash
+mkdir -p ~/.claude/skills/sl && cp skills/sl/SKILL.md ~/.claude/skills/sl/
+```
+
+Then type `/sl` in any session to flip compact on/off for that session only. It takes effect on the next render, no restart. Under the hood it creates/removes `~/.claude/statusline/compact/<session_id>`, so you can also toggle by hand with `touch` / `rm`.
+
+`statusline.js` does not implement compact mode yet.
+
+---
+
 ## Cache files
 
 All in `~/.claude/statusline/` — delete any to force a refresh:
