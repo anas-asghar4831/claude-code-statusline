@@ -602,16 +602,3 @@ L7 += ` ${SEP} ${C.gray}Skills:${R}${C.green}${skillCount}${R}`;
 if (mcpServers.length) L7 += ` ${SEP} ${C.gray}MCP:${R}${C.magenta}${mcpServers.length}${R}`;
 if (VERSION) L7 += ` ${SEP} ${C.gray}v${VERSION}${R}`;
 console.log(L7);
-
-// ── Plugin names (5/line) ─────────────────────────────────────────────────────
-const PER = 5;
-for (let i = 0; i < plugins.length; i += PER) {
-  console.log('   ' + plugins.slice(i, i + PER).map(p => `${C.teal}${p}${R}`).join(`${C.gray}, ${R}`));
-}
-
-// ── MCP server names ──────────────────────────────────────────────────────────
-if (mcpServers.length) {
-  for (let i = 0; i < mcpServers.length; i += PER) {
-    console.log('🔌 ' + (i === 0 ? '' : '   ') + mcpServers.slice(i, i + PER).map(s => `${C.magenta}${s}${R}`).join(`${C.gray}, ${R}`));
-  }
-}
