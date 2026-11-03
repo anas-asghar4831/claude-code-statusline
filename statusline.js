@@ -39,6 +39,8 @@ const MODEL_ID     = g(J, 'model.id', '');
 const SESSION_ID   = g(J, 'session_id', '');
 const SESSION_NAME = g(J, 'session_name', '');
 const VERSION      = g(J, 'version', '');
+// compact is the default; per-session flag file SL_DIR/expanded/<session_id> opts into the full view (toggle via /sl)
+const COMPACT = !(SESSION_ID && !/[\/\\]/.test(SESSION_ID) && fs.existsSync(path.join(SL_DIR, 'expanded', SESSION_ID)));
 
 // dirs
 const DIR          = String(g(J, 'workspace.current_dir', '.')).replace(/\\/g, '/');
@@ -461,10 +463,15 @@ if (SESSION_NAME || SESSION_ID) {
   let Ltitle = '';
   if (SESSION_NAME) Ltitle += `${C.pink}${C.bold}${SESSION_NAME}${R}`;
   if (SESSION_ID)   Ltitle += `${SESSION_NAME ? `  ${SEP}  ` : ''}${C.gray}id:${SESSION_ID}${R}`;
+  if (COMPACT) { // effort + thinking ride on the title line (LINE 1b is hidden)
+    if (EFFORT)   Ltitle += ` ${SEP} ${C.gray}effort:${R}${C.orange}${EFFORT}${R}`;
+    if (THINKING) Ltitle += ` ${SEP} ${C.cyan}💭 thinking${R}`;
+  }
   console.log(Ltitle);
 }
 
 // ── LINE 1b: session tokens ───────────────────────────────────────────────────
+if (!COMPACT) {
 const sTotal = sIn + sOut + sCw + sCr;
 let L1b = `${C.gray}In:${R}${C.blue}${fmtTok(sIn)}${R}`;
 L1b += ` ${SEP} ${C.gray}Out:${R}${C.magenta}${fmtTok(sOut)}${R}`;
@@ -493,6 +500,7 @@ if (cbTotal > 0) {
   }
   console.log(L1c);
 }
+}
 
 // ── LINE 2: rate limits | git changes | ahead/behind | commits | duration | API% | clock ──
 let rateStr = `${C.gray}No rate limit data${R}`;
@@ -508,6 +516,7 @@ if (RATE_5H_RESET) {
   } else s += ` • 7DAY ${Math.round(RATE_7D || 0)}%`;
   rateStr = `${C.yellow}${s}${R}`;
 }
+if (COMPACT) { console.log(rateStr); process.exit(0); } // everything below is hidden in compact mode
 let L2 = rateStr;
 L2 += ` ${SEP} ${C.green}+${LINES_ADD}${R}/${C.red}-${LINES_DEL}${R}`;
 if (gitAhead || gitBehind) L2 += ` ${SEP} ${C.teal}↑${gitAhead}${R}${C.gray}/${R}${C.orange}↓${gitBehind}${R}`;

@@ -797,10 +797,10 @@ int main(void) {
   char MODEL_ID[256]; snprintf(MODEL_ID, sizeof(MODEL_ID), "%s", gstr("/model/id", ""));
   const char *SESSION_ID = gstr("/session_id", "");
   const char *SESSION_NAME = gstr("/session_name", "");
-  // compact mode: per-session flag file SL_DIR/compact/<session_id> (toggle live via the /sl skill)
-  int COMPACT = 0;
-  if (*SESSION_ID && !strpbrk(SESSION_ID, "/\\")) { char cp[1300]; snprintf(cp, sizeof(cp), "%s/compact/%s", SL_DIR, SESSION_ID);
-    FILE *cf = fopen(cp, "rb"); if (cf) { COMPACT = 1; fclose(cf); } }
+  // compact is the default; per-session flag file SL_DIR/expanded/<session_id> opts into the full view (toggle live via the /sl skill)
+  int COMPACT = 1;
+  if (*SESSION_ID && !strpbrk(SESSION_ID, "/\\")) { char cp[1300]; snprintf(cp, sizeof(cp), "%s/expanded/%s", SL_DIR, SESSION_ID);
+    FILE *cf = fopen(cp, "rb"); if (cf) { COMPACT = 0; fclose(cf); } }
   const char *VERSION = gstr("/version", "");
 
   char CWD[1024]; snprintf(CWD, sizeof(CWD), "%s", gstr("/workspace/current_dir", ".")); slashfix(CWD);
